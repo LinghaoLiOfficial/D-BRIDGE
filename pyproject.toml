@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "d-bridge"
+version = "0.2.0"
+description = "Hierarchical incremental semantic label network experiment"
+requires-python = ">=3.11"
+dependencies = [
+    "langgraph>=1.0,<2.0",
+    "langchain-openai>=1.0,<2.0",
+    "neo4j>=5.20,<7.0",
+    "loguru>=0.7,<1.0",
+    "tqdm>=4.66,<5.0",
+    "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<10.0"]
+
+[project.scripts]
+d-bridge = "d_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["d_bridge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
