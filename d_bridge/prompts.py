@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass
+from pathlib import Path
+from string import Formatter
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -22,20 +25,160 @@ class DecisionOutput(BaseModel):
     reason: str = Field(description="简短判断依据")
 
 
-def extraction_messages(posts: list[dict[str, Any]]) -> list[tuple[str, str]]:
+@dataclass(frozen=True)
+class PromptTemplate:
+    version: str
+    allowed_variables: tuple[str, ...]
+    system: str
+    human: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "version": self.version,
+            "allowed_variables": list(self.allowed_variables),
+            "messages": {"system": self.system, "human": self.human},
+        }
+
+
+@dataclass(frozen=True)
+class PromptCatalog:
+    schema_version: str
+    templates: dict[str, PromptTemplate]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "templates": {
+                name: template.to_dict()
+                for name, template in self.templates.items()
+            },
+        }
+
+    def version_summary(self, snapshot_file: str = "prompts.json") -> dict[str, Any]:
+        return {
+            "snapshot_file": snapshot_file,
+            "schema_version": self.schema_version,
+            "versions": {
+                name: template.version
+                for name, template in self.templates.items()
+            },
+        }
+
+
+REQUIRED_TEMPLATE_VARIABLES = {
+    "concept_extraction": {"posts_json"},
+    "relation_decision": {"input_json"},
+}
+SUPPORTED_SCHEMA_VERSION = "1.0"
+
+
+def _template_fields(value: str, template_name: str, message_name: str) -> set[str]:
+    fields: set[str] = set()
+    try:
+        parsed = Formatter().parse(value)
+        for _, field_name, format_spec, conversion in parsed:
+            if field_name is None:
+                continue
+            if not field_name or format_spec or conversion or any(char in field_name for char in (".", "[", "]")):
+                raise ValueError(
+                    f"Prompt template {template_name}.{message_name} contains an unsupported placeholder: {field_name!r}"
+                )
+            fields.add(field_name)
+    except ValueError as exc:
+        if str(exc).startswith("Prompt template"):
+            raise
+        raise ValueError(
+            f"Prompt template {template_name}.{message_name} has invalid placeholder syntax"
+        ) from exc
+    return fields
+
+
+def load_prompt_catalog(path: Path) -> PromptCatalog:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise ValueError(f"Prompt template file does not exist: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Prompt template file is not valid JSON: {path}: {exc.msg}") from exc
+
+    if not isinstance(raw, dict):
+        raise ValueError("Prompt template file root must be a JSON object")
+    schema_version = raw.get("schema_version")
+    if not isinstance(schema_version, str) or not schema_version.strip():
+        raise ValueError("Prompt template schema_version must be a non-empty string")
+    if schema_version != SUPPORTED_SCHEMA_VERSION:
+        raise ValueError(
+            f"Unsupported prompt template schema_version: {schema_version!r}; expected {SUPPORTED_SCHEMA_VERSION!r}"
+        )
+    raw_templates = raw.get("templates")
+    if not isinstance(raw_templates, dict):
+        raise ValueError("Prompt template file must contain a templates object")
+
+    templates: dict[str, PromptTemplate] = {}
+    for name, required_variables in REQUIRED_TEMPLATE_VARIABLES.items():
+        raw_template = raw_templates.get(name)
+        if not isinstance(raw_template, dict):
+            raise ValueError(f"Prompt template is missing required template: {name}")
+        version = raw_template.get("version")
+        if not isinstance(version, str) or not version.strip():
+            raise ValueError(f"Prompt template {name}.version must be a non-empty string")
+        allowed_variables = raw_template.get("allowed_variables")
+        if (
+            not isinstance(allowed_variables, list)
+            or any(not isinstance(item, str) or not item for item in allowed_variables)
+            or len(set(allowed_variables)) != len(allowed_variables)
+        ):
+            raise ValueError(f"Prompt template {name}.allowed_variables must be a unique list of strings")
+        messages = raw_template.get("messages")
+        if not isinstance(messages, dict):
+            raise ValueError(f"Prompt template {name}.messages must be an object")
+        system = messages.get("system")
+        human = messages.get("human")
+        if not isinstance(system, str) or not system.strip():
+            raise ValueError(f"Prompt template {name}.messages.system must be a non-empty string")
+        if not isinstance(human, str) or not human.strip():
+            raise ValueError(f"Prompt template {name}.messages.human must be a non-empty string")
+
+        declared = set(allowed_variables)
+        used = _template_fields(system, name, "system") | _template_fields(human, name, "human")
+        unknown = used - declared
+        if unknown:
+            raise ValueError(f"Prompt template {name} uses undeclared variables: {sorted(unknown)}")
+        missing = required_variables - used
+        if missing:
+            raise ValueError(f"Prompt template {name} is missing required variables: {sorted(missing)}")
+        unsupported = declared - required_variables
+        if unsupported:
+            raise ValueError(f"Prompt template {name} declares unsupported variables: {sorted(unsupported)}")
+        unused = declared - used
+        if unused:
+            raise ValueError(f"Prompt template {name} declares unused variables: {sorted(unused)}")
+        templates[name] = PromptTemplate(version.strip(), tuple(allowed_variables), system, human)
+
+    return PromptCatalog(schema_version.strip(), templates)
+
+
+def _render_template(template_name: str, template: PromptTemplate, values: dict[str, str]) -> list[tuple[str, str]]:
+    expected = set(template.allowed_variables)
+    received = set(values)
+    if received != expected:
+        raise ValueError(
+            f"Prompt template {template_name} expected variables {sorted(expected)}, got {sorted(received)}"
+        )
+    return [
+        ("system", template.system.format_map(values)),
+        ("human", template.human.format_map(values)),
+    ]
+
+
+def extraction_messages(catalog: PromptCatalog, posts: list[dict[str, Any]]) -> list[tuple[str, str]]:
     payload = json.dumps(posts, ensure_ascii=False, indent=2)
-    return [
-        ("system", "你是中文社交媒体语义标注专家。任务目标：从帖子中提取彼此独立、可复用的原子语义主题概念。仅输出符合 schema 的 JSON。保留具体主题，不把情绪、句子或整帖当概念。"),
-        ("human", f"输入字段：post_id（来源标识）、created_at（时间）、hotness（热度）、text（帖子正文）。输出字段 concepts：概念对象数组；每项包含 name（简短规范中文名词短语）和 source_post_ids（直接表达该概念的帖子 ID 数组），合并重复概念并合并来源。\n帖子数据：\n{payload}"),
-    ]
+    return _render_template("concept_extraction", catalog.templates["concept_extraction"], {"posts_json": payload})
 
 
-def decision_messages(concept: str, candidates: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    payload = json.dumps(candidates, ensure_ascii=False, indent=2)
-    return [
-        ("system", "你是语义标签本体工程专家。严格区分完全等价与上下位/相关关系。仅输出符合 schema 的 JSON。"),
-        ("human", f"判断新概念与候选概念的关系。输入字段：new_concept（新概念）；candidates（候选 concept_id、name、similarity）。输出字段：equivalent_to（仅完全同义时填候选 ID，否则 null）；target_concept_id（选最相关候选作为关系目标，无候选时 null）；relation（仅可为上位、下位、相似、无关）；reason。关系视角固定为‘新概念相对目标候选’：新概念更宽泛选上位，新概念更具体选下位，语义关联但不构成上下位选相似，无关选无关。没有候选时 equivalent_to=null、target_concept_id=null 且 relation=无关。\n输入数据：\n{json.dumps({'new_concept': concept, 'candidates': candidates}, ensure_ascii=False, indent=2)}"),
-    ]
+def decision_messages(catalog: PromptCatalog, concept: str, candidates: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    payload = json.dumps({"new_concept": concept, "candidates": candidates}, ensure_ascii=False, indent=2)
+    return _render_template("relation_decision", catalog.templates["relation_decision"], {"input_json": payload})
 
 
 def normalize_concepts(value: Any) -> list[dict[str, Any]]:

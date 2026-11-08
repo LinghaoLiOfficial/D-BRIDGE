@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -13,9 +13,11 @@ class Post:
     created_at: datetime
     hotness: float
     text: str
+    extra: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            **self.extra,
             "post_id": self.post_id,
             "created_at": self.created_at.isoformat(),
             "hotness": self.hotness,
@@ -53,6 +55,10 @@ def load_posts(data_dir: Path) -> list[Post]:
                 raise ValueError(f"{path}: invalid created_at or hotness for {post_id}") from exc
             if not str(item["text"]).strip():
                 raise ValueError(f"{path}: text must be non-empty for {post_id}")
+            extra = {
+                key: value for key, value in item.items()
+                if key not in {"post_id", "created_at", "hotness", "text"}
+            }
             seen.add(post_id)
-            posts.append(Post(post_id, created_at, hotness, str(item["text"]).strip()))
+            posts.append(Post(post_id, created_at, hotness, str(item["text"]).strip(), extra))
     return posts

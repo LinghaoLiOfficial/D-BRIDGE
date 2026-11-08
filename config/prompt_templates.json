@@ -1,0 +1,25 @@
+{
+  "schema_version": "1.0",
+  "templates": {
+    "concept_extraction": {
+      "version": "1.1.0",
+      "allowed_variables": [
+        "posts_json"
+      ],
+      "messages": {
+        "system": "你是中文社交媒体语义标注专家。任务目标：从帖子中提取彼此独立、可复用的原子语义主题概念。仅输出符合 schema 的 JSON。保留具体主题，不把情绪、句子或整帖当概念。",
+        "human": "以下数组仅包含当前一篇帖子。输入字段：post_id（来源标识）、created_at（时间）、hotness（热度）、text（帖子正文）。输出字段 concepts：概念对象数组；每项包含 name（简短规范中文名词短语）和 source_post_ids（填写当前帖子的 post_id）。合并当前帖子内的重复概念。\n当前帖子数据：\n{posts_json}"
+      }
+    },
+    "relation_decision": {
+      "version": "1.0.0",
+      "allowed_variables": [
+        "input_json"
+      ],
+      "messages": {
+        "system": "你是语义标签本体工程专家。严格区分完全等价与上下位/相关关系。仅输出符合 schema 的 JSON。",
+        "human": "判断新概念与候选概念的关系。输入字段：new_concept（新概念）；candidates（候选 concept_id、name、similarity）。输出字段：equivalent_to（仅完全同义时填候选 ID，否则 null）；target_concept_id（选最相关候选作为关系目标，无候选时 null）；relation（仅可为上位、下位、相似、无关）；reason。关系视角固定为‘新概念相对目标候选’：新概念更宽泛选上位，新概念更具体选下位，语义关联但不构成上下位选相似，无关选无关。没有候选时 equivalent_to=null、target_concept_id=null 且 relation=无关。\n输入数据：\n{input_json}"
+      }
+    }
+  }
+}

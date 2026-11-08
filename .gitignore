@@ -5,10 +5,13 @@
 
 # Local tooling and generated files
 .DS_Store
+.idea/
 __pycache__/
 *.py[cod]
+.pytest_cache/
 .venv/
 venv/
 node_modules/
 dist/
 build/
+result/

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, TypedDict
 
@@ -12,7 +13,15 @@ from tqdm import tqdm
 
 from .config import Settings
 from .data import Post
-from .prompts import DecisionOutput, ConceptsOutput, decision_messages, extraction_messages, normalize_concepts, normalize_decision
+from .prompts import (
+    DecisionOutput,
+    ConceptsOutput,
+    PromptCatalog,
+    decision_messages,
+    extraction_messages,
+    normalize_concepts,
+    normalize_decision,
+)
 from .sampling import stratified_sample
 from .storage import Concept, GraphStore
 
@@ -28,10 +37,74 @@ class ExperimentState(TypedDict, total=False):
     decision: dict[str, Any]
     labels: list[dict[str, Any]]
     decisions: list[dict[str, Any]]
+    llm_usage: list[dict[str, Any]]
+    sampling_report: dict[str, Any]
 
 
 def _message_objects(messages: list[tuple[str, str]]) -> list[Any]:
     return [SystemMessage(content=content) if role == "system" else HumanMessage(content=content) for role, content in messages]
+
+
+def _token_value(primary: dict[str, Any], fallback: dict[str, Any], *names: str) -> int | None:
+    for source in (primary, fallback):
+        for name in names:
+            value = source.get(name)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    return None
+
+
+def _response_usage(raw: Any) -> dict[str, Any]:
+    usage_metadata = getattr(raw, "usage_metadata", None)
+    usage_metadata = usage_metadata if isinstance(usage_metadata, dict) else {}
+    response_metadata = getattr(raw, "response_metadata", None)
+    response_metadata = response_metadata if isinstance(response_metadata, dict) else {}
+    token_usage = response_metadata.get("token_usage")
+    token_usage = token_usage if isinstance(token_usage, dict) else {}
+    input_tokens = _token_value(usage_metadata, token_usage, "input_tokens", "prompt_tokens")
+    output_tokens = _token_value(usage_metadata, token_usage, "output_tokens", "completion_tokens")
+    total_tokens = _token_value(usage_metadata, token_usage, "total_tokens")
+    if total_tokens is None and input_tokens is not None and output_tokens is not None:
+        total_tokens = input_tokens + output_tokens
+    return {
+        "available": any(value is not None for value in (input_tokens, output_tokens, total_tokens)),
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "model": response_metadata.get("model_name") or response_metadata.get("model"),
+        "response_id": getattr(raw, "id", None),
+        "system_fingerprint": response_metadata.get("system_fingerprint"),
+    }
+
+
+def _invoke_structured(chat_model: Any, schema: Any, messages: list[tuple[str, str]]) -> tuple[Any, dict[str, Any]]:
+    structured = chat_model.with_structured_output(schema, include_raw=True)
+    response = structured.invoke(_message_objects(messages))
+    if isinstance(response, dict) and "parsed" in response:
+        parsing_error = response.get("parsing_error")
+        if parsing_error is not None:
+            raise ValueError(f"Unable to parse structured LLM response: {parsing_error}")
+        return response["parsed"], _response_usage(response.get("raw"))
+    return response, _response_usage(response)
+
+
+def _merge_post_concepts(
+    batches: list[tuple[int, str, list[dict[str, Any]]]],
+) -> list[dict[str, Any]]:
+    merged: dict[str, dict[str, Any]] = {}
+    for _, post_id, concepts in sorted(batches, key=lambda item: item[0]):
+        for concept in concepts:
+            name = concept["name"].strip()
+            key = "".join(name.split()).casefold()
+            if not key:
+                continue
+            if key not in merged:
+                merged[key] = {"name": name, "source_post_ids": set()}
+            merged[key]["source_post_ids"].add(post_id)
+    return [
+        {"name": item["name"], "source_post_ids": sorted(item["source_post_ids"])}
+        for item in merged.values()
+    ]
 
 
 def build_experiment_graph(
@@ -40,8 +113,14 @@ def build_experiment_graph(
     embedding_model: Any,
     graph_store: GraphStore,
     logger: Any,
+    prompt_catalog: PromptCatalog,
+    trial_index: int = 1,
+    seed: int = 42,
+    usage_collector: list[dict[str, Any]] | None = None,
+    sampling_collector: dict[str, Any] | None = None,
 ):
     progress: dict[str, tqdm] = {}
+    collected_usage = usage_collector if usage_collector is not None else []
 
     def sample_node(state: ExperimentState) -> dict[str, Any]:
         posts = state["posts"]
@@ -50,34 +129,131 @@ def build_experiment_graph(
             created_at=datetime.fromisoformat(item["created_at"].replace("Z", "+00:00")),
             hotness=float(item["hotness"]),
             text=item["text"],
+            extra={
+                key: value for key, value in item.items()
+                if key not in {"post_id", "created_at", "hotness", "text"}
+            },
         ) for item in posts]
-        sampled = [post.to_dict() for post in stratified_sample(
-            post_objects, settings.sample_size, settings.time_bins, settings.hotness_bins
-        )]
-        logger.bind(task="分层数据抽样").info("业务输入={} 业务输出={}", json.dumps(posts, ensure_ascii=False), json.dumps(sampled, ensure_ascii=False))
-        return {"sampled_posts": sampled, "labels": [], "decisions": []}
+        sampling = stratified_sample(
+            post_objects,
+            settings.sample_size,
+            settings.time_bins,
+            settings.hotness_bins,
+            seed=seed,
+        )
+        sampled = [post.to_dict() for post in sampling.posts]
+        if sampling_collector is not None:
+            sampling_collector.clear()
+            sampling_collector.update(sampling.report)
+        graph_store.initialize_posts(sampled, settings.neo4j_batch_size)
+        logger.bind(task="分层数据抽样", sampling_report=sampling.report, trial_index=trial_index, seed=seed).info(
+            "业务输入={} 业务输出={}",
+            json.dumps(posts, ensure_ascii=False),
+            json.dumps(sampled, ensure_ascii=False),
+        )
+        return {
+            "sampled_posts": sampled,
+            "sampling_report": sampling.report,
+            "labels": [],
+            "decisions": [],
+            "llm_usage": [],
+        }
 
     def extract_node(state: ExperimentState) -> dict[str, Any]:
-        messages = extraction_messages(state["sampled_posts"])
+        posts = state["sampled_posts"]
         started = time.perf_counter()
-        logger.bind(task="原子语义概念提取").info("LLM输入={}", json.dumps(messages, ensure_ascii=False))
-        try:
-            structured = chat_model.with_structured_output(ConceptsOutput)
-            response = structured.invoke(_message_objects(messages))
-            concepts = normalize_concepts(response)
-            progress["bar"] = tqdm(total=len(concepts), desc="概念处理", unit="概念")
-            known_posts = {post["post_id"] for post in state["sampled_posts"]}
-            for concept in concepts:
-                concept["source_post_ids"] = [post_id for post_id in concept["source_post_ids"] if post_id in known_posts]
-                if not concept["source_post_ids"]:
-                    concept["source_post_ids"] = sorted(known_posts)
-            logger.bind(task="原子语义概念提取").info(
-                "LLM输出={} 耗时秒={:.3f}", json.dumps(concepts, ensure_ascii=False), time.perf_counter() - started
+        extraction_progress = tqdm(total=len(posts), desc="帖子概念提取", unit="帖子")
+        results: list[tuple[int, str, list[dict[str, Any]], dict[str, Any]]] = []
+
+        def extract_post(post_index: int, post: dict[str, Any]):
+            post_id = post["post_id"]
+            messages = extraction_messages(prompt_catalog, [post])
+            post_started = time.perf_counter()
+            bound = logger.bind(
+                task="原子语义概念提取",
+                trial_index=trial_index,
+                seed=seed,
+                post_id=post_id,
+                post_index=post_index,
             )
-            return {"concepts": concepts, "concept_index": 0}
+            bound.info("LLM输入={}", json.dumps(messages, ensure_ascii=False))
+            try:
+                response, usage = _invoke_structured(chat_model, ConceptsOutput, messages)
+                concepts = normalize_concepts(response)
+                for concept in concepts:
+                    concept["source_post_ids"] = [post_id]
+                usage.update({
+                    "task": "原子语义概念提取",
+                    "trial_index": trial_index,
+                    "seed": seed,
+                    "post_id": post_id,
+                    "post_index": post_index,
+                    "duration_seconds": round(time.perf_counter() - post_started, 6),
+                })
+                logger.bind(
+                    task="原子语义概念提取",
+                    trial_index=trial_index,
+                    seed=seed,
+                    post_id=post_id,
+                    post_index=post_index,
+                    llm_usage=usage,
+                ).info(
+                    "LLM输出={} 耗时秒={:.3f}",
+                    json.dumps(concepts, ensure_ascii=False),
+                    time.perf_counter() - post_started,
+                )
+                return post_index, post_id, concepts, usage
+            except Exception:
+                bound.exception("LLM任务失败，耗时秒={:.3f}", time.perf_counter() - post_started)
+                raise
+
+        workers = max(1, min(settings.concept_extraction_concurrency, len(posts)))
+        executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="concept-extraction")
+        futures: dict[Future, tuple[int, str]] = {}
+        try:
+            futures = {
+                executor.submit(extract_post, post_index, post): (post_index, post["post_id"])
+                for post_index, post in enumerate(posts)
+            }
+            for future in as_completed(futures):
+                results.append(future.result())
+                extraction_progress.update(1)
         except Exception:
-            logger.bind(task="原子语义概念提取").exception("LLM任务失败，耗时秒={:.3f}", time.perf_counter() - started)
+            for future in futures:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
+            completed_indexes = {item[0] for item in results}
+            for future in futures:
+                if future.cancelled() or not future.done() or future.exception() is not None:
+                    continue
+                result = future.result()
+                if result[0] not in completed_indexes:
+                    results.append(result)
+                    completed_indexes.add(result[0])
+            results.sort(key=lambda item: item[0])
+            collected_usage.extend(item[3] for item in results)
+            logger.bind(task="原子语义概念提取", trial_index=trial_index, seed=seed).exception(
+                "逐帖概念提取失败，耗时秒={:.3f}", time.perf_counter() - started
+            )
             raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+            extraction_progress.close()
+
+        results.sort(key=lambda item: item[0])
+        collected_usage.extend(item[3] for item in results)
+        concepts = _merge_post_concepts([
+            (post_index, post_id, post_concepts)
+            for post_index, post_id, post_concepts, _ in results
+        ])
+        progress["bar"] = tqdm(total=len(concepts), desc="概念处理", unit="概念")
+        logger.bind(task="原子语义概念提取", trial_index=trial_index, seed=seed).info(
+            "逐帖提取完成，帖子数={} 合并后概念数={} 总耗时秒={:.3f}",
+            len(posts),
+            len(concepts),
+            time.perf_counter() - started,
+        )
+        return {"concepts": concepts, "concept_index": 0, "llm_usage": list(collected_usage)}
 
     def prepare_node(state: ExperimentState) -> dict[str, Any]:
         concept = state["concepts"][state["concept_index"]]
@@ -107,12 +283,22 @@ def build_experiment_graph(
 
     def reconcile_node(state: ExperimentState) -> dict[str, Any]:
         concept = state["current_concept"]
-        messages = decision_messages(concept["name"], state["candidates"])
+        messages = decision_messages(prompt_catalog, concept["name"], state["candidates"])
         started = time.perf_counter()
         logger.bind(task="等价判定与层级关系识别").info("LLM输入={}", json.dumps(messages, ensure_ascii=False))
         try:
-            structured = chat_model.with_structured_output(DecisionOutput)
-            response = structured.invoke(_message_objects(messages))
+            response, usage = _invoke_structured(chat_model, DecisionOutput, messages)
+            usage.update({
+                "task": "等价判定与层级关系识别",
+                "trial_index": trial_index,
+                "seed": seed,
+                "concept": concept["name"],
+                "duration_seconds": round(time.perf_counter() - started, 6),
+            })
+            collected_usage.append(usage)
+            logger.bind(task="等价判定与层级关系识别", llm_usage=usage, trial_index=trial_index, seed=seed).info(
+                "LLM调用完成，耗时秒={:.3f}", time.perf_counter() - started
+            )
             decision = normalize_decision(response)
             candidate_ids = {item["concept_id"] for item in state["candidates"]}
             equivalent = decision["equivalent_to"]
@@ -126,10 +312,10 @@ def build_experiment_graph(
             elif decision["relation"] in {"上位", "下位", "相似"} and target is None and state["candidates"]:
                 target = state["candidates"][0]["concept_id"]
                 decision["target_concept_id"] = target
-            logger.bind(task="等价判定与层级关系识别").info(
+            logger.bind(task="等价判定与层级关系识别", llm_usage=usage, trial_index=trial_index, seed=seed).info(
                 "LLM输出={} 耗时秒={:.3f}", json.dumps(decision, ensure_ascii=False), time.perf_counter() - started
             )
-            return {"decision": decision}
+            return {"decision": decision, "llm_usage": list(collected_usage)}
         except Exception:
             logger.bind(task="等价判定与层级关系识别").exception("LLM任务失败，耗时秒={:.3f}", time.perf_counter() - started)
             raise
