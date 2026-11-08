@@ -62,13 +62,15 @@ ID 必须非空且全局唯一，时间必须为 ISO-8601，热度需为数值�
 
 概念提取按帖子分别调用模型，`CONCEPT_EXTRACTION_CONCURRENCY` 控制最大并发数，默认 `3`。每篇帖子内先规范化概念，跨帖子再按移除空白并忽略大小写后的名称确定性合并，同时合并来源帖子 ID；不会额外调用 LLM 或 Embedding 做语义近义合并。
 
+合并后的概念按 `CONCEPT_PROCESSING_CONCURRENCY` 分批处理，控制等价/关系判定 LLM 的最大并发数，默认 `3`。每批概念基于该批开始时的图谱检索候选，并在判定完成后按原顺序写入图谱；下一批会看到前一批的更新。设置为 `1` 时概念处理保持逐个顺序执行。
+
 `EXPERIMENT_SEEDS` 使用 JSON 整数数组，数组长度就是 trial 数量：默认 `[42]` 只运行一次，设置为 `[42,43,44]` 会运行三次，也允许使用重复种子。每轮会设置 Python `random` 和 NumPy 的全局随机状态；Pandas 随机操作依赖 NumPy，全新随机代码仍应显式传入 `random_state`。这些 seed 不会传给 LLM，只控制本地 Python 随机性，包括分箱并列值、配额平局和层内样本；相同 seed 可复现同一批样本，不同 seed 用于观察抽样与后续输出的变化。
 
 每轮开始前清空 D-BRIDGE 图谱，完成后先导出该轮快照。多轮成功时 Neo4j 最终保留最后一轮图谱；任一轮失败会立即停止后续轮次，写出失败摘要并清理失败轮的残留数据。`summary.json` 对概念、标签和关系集合计算两两 Jaccard 与完全一致率；只有一轮时稳定性状态为 `insufficient_samples`。
 
 提示词模板默认从 `config/prompt_templates.json` 加载，也可通过 `PROMPT_TEMPLATE_PATH` 指向其他 JSON 文件，以便在不同模板版本之间切换。概念提取与关系判定模板各自维护 `version`；修改任一模板正文时应同步升级对应版本。模板中的 `allowed_variables` 必须与正文占位符一致，程序会在调用模型前校验必需变量、未知变量和消息结构。每次运行会复制实际模板到结果目录，并在 `config.json` 和 `result.json` 中记录版本，因此后续修改源模板不会影响历史实验的追溯。
 
-LangGraph 包含 `extract_atomic_concepts` 与 `classify_equivalence_and_relation` 两个真实聊天模型调用节点，并在每个概念上循环执行相似候选检索、判定与图谱更新。支持的关系为“上位”“下位”“相似”“无关”；Neo4j 中用 `IS_A` 表示上下位，用 `RELATED_TO` 表示相似，帖子来源用 `MENTIONS` 表示，等价概念合并后转移到规范节点。
+LangGraph 包含 `extract_atomic_concepts` 与 `classify_equivalence_and_relation` 两个真实聊天模型调用节点；概念处理按配置并发判定，并按批次顺序增量更新图谱。支持的关系为“上位”“下位”“相似”“无关”；Neo4j 中用 `IS_A` 表示上下位，用 `RELATED_TO` 表示相似，帖子来源用 `MENTIONS` 表示，等价概念合并后转移到规范节点。
 
 ## 测试与排查
 

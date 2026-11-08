@@ -4,6 +4,7 @@ import json
 import random
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -122,6 +123,62 @@ class ConcurrentChatModel:
         return {"raw": raw, "parsed": parsed, "parsing_error": None}
 
 
+class ConcurrentDecisionChatModel:
+    def __init__(self, *, fail_concept=None):
+        self.fail_concept = fail_concept
+        self.active_decisions = 0
+        self.max_active_decisions = 0
+        self.decision_names = []
+        self.lock = threading.Lock()
+
+    def with_structured_output(self, schema, *, include_raw=False):
+        parent = self
+
+        class StructuredCall:
+            def invoke(self, messages):
+                return parent._invoke(schema, messages, include_raw)
+
+        return StructuredCall()
+
+    def _invoke(self, schema, messages, include_raw):
+        human = messages[-1].content
+        if schema is ConceptsOutput:
+            parsed = {"concepts": [
+                {"name": f"概念{i}", "source_post_ids": ["wrong"]}
+                for i in range(1, 5)
+            ]}
+            call_number = 1
+        else:
+            input_data = json.loads(human.rsplit("输入数据：\n", 1)[1])
+            concept = input_data["new_concept"]
+            with self.lock:
+                self.active_decisions += 1
+                self.max_active_decisions = max(self.max_active_decisions, self.active_decisions)
+                self.decision_names.append(concept)
+                call_number = len(self.decision_names) + 1
+            try:
+                time.sleep({"概念1": 0.06, "概念2": 0.01, "概念3": 0.03, "概念4": 0.01}[concept])
+                if concept == self.fail_concept:
+                    raise RuntimeError(f"failed decision for {concept}")
+                parsed = {
+                    "equivalent_to": None,
+                    "target_concept_id": None,
+                    "relation": "无关",
+                    "reason": "无候选",
+                }
+            finally:
+                with self.lock:
+                    self.active_decisions -= 1
+        if not include_raw:
+            return parsed
+        raw = SimpleNamespace(
+            id=f"decision-response-{call_number}",
+            usage_metadata={"input_tokens": 10, "output_tokens": 5, "total_tokens": 15},
+            response_metadata={"model_name": "fake-model", "system_fingerprint": None},
+        )
+        return {"raw": raw, "parsed": parsed, "parsing_error": None}
+
+
 class FakeEmbeddings:
     def embed_query(self, _text):
         return [1.0, 0.0]
@@ -132,6 +189,7 @@ class MemoryGraphStore:
         self.nodes = {}
         self.posts = {}
         self.relationships = []
+        self.candidate_snapshots = []
         self.closed = False
         self.reset_calls = 0
 
@@ -142,6 +200,7 @@ class MemoryGraphStore:
         self.relationships.clear()
 
     def candidates(self, _embedding, _top_k):
+        self.candidate_snapshots.append(list(self.nodes))
         return [
             {"concept_id": concept.concept_id, "name": concept.name, "similarity": 0.9}
             for concept in self.nodes.values()
@@ -206,6 +265,7 @@ def settings(**overrides):
         timeout=1.0,
         max_retries=0,
         concept_extraction_concurrency=3,
+        concept_processing_concurrency=3,
         embedding_base_url="https://example.invalid/v1",
         embedding_api_key="secret-embedding-key",
         embedding_model="test-embedding",
@@ -481,6 +541,71 @@ def test_concurrent_per_post_extraction_merges_deterministically():
     assert [item["post_id"] for item in extraction_usage] == ["p1", "p2", "p3"]
 
 
+def test_concept_processing_runs_bounded_parallel_decisions_and_updates_in_order():
+    config = settings(sample_size=1, concept_processing_concurrency=2)
+    store = MemoryGraphStore()
+    chat = ConcurrentDecisionChatModel()
+    graph = build_experiment_graph(
+        config, chat, FakeEmbeddings(), store, CaptureLogger(), load_prompt_catalog(config.prompt_template_path)
+    )
+
+    state = graph.invoke({"posts": [
+        {"post_id": "p1", "created_at": "2026-01-01T00:00:00+00:00", "hotness": 1, "text": "测试"},
+    ]})
+
+    expected_ids = ["concept_" + uuid.uuid5(uuid.NAMESPACE_URL, f"概念{i}").hex
+                    for i in range(1, 5)]
+    assert chat.max_active_decisions == 2
+    assert chat.decision_names == ["概念1", "概念2", "概念3", "概念4"]
+    assert list(store.nodes) == expected_ids
+    assert store.candidate_snapshots == [[], [], expected_ids[:2], expected_ids[:2]]
+    assert [item["concept"] for item in state["decisions"]] == [f"概念{i}" for i in range(1, 5)]
+    assert [item["concept_index"] for item in state["llm_usage"]
+            if item["task"] == "等价判定与层级关系识别"] == [0, 1, 2, 3]
+
+
+def test_concept_processing_concurrency_one_is_sequential():
+    config = settings(sample_size=1, concept_processing_concurrency=1)
+    chat = ConcurrentDecisionChatModel()
+    graph = build_experiment_graph(
+        config, chat, FakeEmbeddings(), MemoryGraphStore(), CaptureLogger(),
+        load_prompt_catalog(config.prompt_template_path),
+    )
+
+    graph.invoke({"posts": [
+        {"post_id": "p1", "created_at": "2026-01-01T00:00:00+00:00", "hotness": 1, "text": "测试"},
+    ]})
+
+    assert chat.max_active_decisions == 1
+    assert chat.decision_names == ["概念1", "概念2", "概念3", "概念4"]
+
+
+def test_failed_concept_batch_preserves_completed_usage_and_does_not_update_graph():
+    config = settings(sample_size=1, concept_processing_concurrency=2)
+    store = MemoryGraphStore()
+    chat = ConcurrentDecisionChatModel(fail_concept="概念2")
+    usage = []
+    graph = build_experiment_graph(
+        config,
+        chat,
+        FakeEmbeddings(),
+        store,
+        CaptureLogger(),
+        load_prompt_catalog(config.prompt_template_path),
+        usage_collector=usage,
+    )
+
+    with pytest.raises(RuntimeError, match="failed decision for 概念2"):
+        graph.invoke({"posts": [
+            {"post_id": "p1", "created_at": "2026-01-01T00:00:00+00:00", "hotness": 1, "text": "测试"},
+        ]})
+
+    assert chat.decision_names == ["概念1", "概念2"]
+    assert store.nodes == {}
+    assert [item["concept"] for item in usage
+            if item["task"] == "等价判定与层级关系识别"] == ["概念1"]
+
+
 def test_failed_per_post_extraction_preserves_completed_usage():
     config = settings(sample_size=2, concept_extraction_concurrency=1)
     store = MemoryGraphStore()
@@ -570,6 +695,7 @@ def test_explicit_env_file_overrides_inherited_credentials(tmp_path, monkeypatch
         "NEO4J_PASSWORD": "file-neo4j-password",
         "ENABLE_THINKING": "TrUe",
         "CONCEPT_EXTRACTION_CONCURRENCY": "4",
+        "CONCEPT_PROCESSING_CONCURRENCY": "5",
     }
     for name in configured:
         monkeypatch.setenv(name, f"inherited-{name.lower()}")
@@ -586,11 +712,13 @@ def test_explicit_env_file_overrides_inherited_credentials(tmp_path, monkeypatch
     assert loaded.neo4j_password == "file-neo4j-password"
     assert loaded.enable_thinking is True
     assert loaded.concept_extraction_concurrency == 4
+    assert loaded.concept_processing_concurrency == 5
 
 
 def test_thinking_and_extraction_concurrency_defaults(tmp_path, monkeypatch):
     monkeypatch.delenv("ENABLE_THINKING", raising=False)
     monkeypatch.delenv("CONCEPT_EXTRACTION_CONCURRENCY", raising=False)
+    monkeypatch.delenv("CONCEPT_PROCESSING_CONCURRENCY", raising=False)
     env_file = tmp_path / "defaults.env"
     env_file.write_text(
         "\n".join([
@@ -608,6 +736,7 @@ def test_thinking_and_extraction_concurrency_defaults(tmp_path, monkeypatch):
 
     assert loaded.enable_thinking is False
     assert loaded.concept_extraction_concurrency == 3
+    assert loaded.concept_processing_concurrency == 3
 
 
 @pytest.mark.parametrize("value", ["1", "yes", "", "disabled"])
@@ -647,6 +776,27 @@ def test_concept_extraction_concurrency_must_be_positive(tmp_path):
     )
 
     with pytest.raises(ValueError, match="CONCEPT_EXTRACTION_CONCURRENCY must be >= 1"):
+        load_settings(env_file)
+
+
+def test_concept_processing_concurrency_must_be_positive(tmp_path, monkeypatch):
+    monkeypatch.delenv("CONCEPT_EXTRACTION_CONCURRENCY", raising=False)
+    monkeypatch.delenv("CONCEPT_PROCESSING_CONCURRENCY", raising=False)
+    env_file = tmp_path / "invalid-processing-concurrency.env"
+    env_file.write_text(
+        "\n".join([
+            "API_KEY=chat-key",
+            "BASE_URL=https://chat.example/v1",
+            "MODEL=qwen-test",
+            "EMBEDDING_API_KEY=embedding-key",
+            "EMBEDDING_BASE_URL=https://embedding.example/v1",
+            "EMBEDDING_MODEL=embedding-model",
+            "CONCEPT_PROCESSING_CONCURRENCY=0",
+        ]),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="CONCEPT_PROCESSING_CONCURRENCY must be >= 1"):
         load_settings(env_file)
 
 

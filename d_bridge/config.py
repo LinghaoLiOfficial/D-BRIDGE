@@ -30,6 +30,7 @@ class Settings:
     timeout: float
     max_retries: int
     concept_extraction_concurrency: int
+    concept_processing_concurrency: int
     embedding_base_url: str
     embedding_api_key: str = field(repr=False)
     embedding_model: str
@@ -125,6 +126,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         timeout=number("TIMEOUT", 60.0, 0.1),
         max_retries=integer("MAX_RETRIES", 2, 0),
         concept_extraction_concurrency=integer("CONCEPT_EXTRACTION_CONCURRENCY", 3),
+        concept_processing_concurrency=integer("CONCEPT_PROCESSING_CONCURRENCY", 3),
         embedding_base_url=embedding_base_url,
         embedding_api_key=embedding_api_key,
         embedding_model=required("EMBEDDING_MODEL"),

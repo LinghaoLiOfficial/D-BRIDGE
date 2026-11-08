@@ -255,112 +255,159 @@ def build_experiment_graph(
         )
         return {"concepts": concepts, "concept_index": 0, "llm_usage": list(collected_usage)}
 
-    def prepare_node(state: ExperimentState) -> dict[str, Any]:
-        concept = state["concepts"][state["concept_index"]]
-        started = time.perf_counter()
-        try:
-            embedding = embedding_model.embed_query(concept["name"])
-            if len(embedding) != settings.embedding_dimensions:
-                raise ValueError(
-                    f"Embedding has {len(embedding)} dimensions; configured EMBEDDING_DIMENSIONS={settings.embedding_dimensions}"
-                )
-            candidates = graph_store.candidates(embedding, settings.similarity_top_k)
-            candidates = [
-                item for item in candidates
-                if float(item["similarity"]) >= settings.similarity_threshold
-            ]
-            logger.bind(task="语义相似节点检索").info(
-                "业务输入={} 业务输出={} 耗时秒={:.3f}",
-                json.dumps({"concept": concept["name"], "top_k": settings.similarity_top_k,
-                            "threshold": settings.similarity_threshold}, ensure_ascii=False),
-                json.dumps(candidates, ensure_ascii=False),
-                time.perf_counter() - started,
-            )
-            return {"current_concept": concept, "current_embedding": embedding, "candidates": candidates}
-        except Exception:
-            logger.bind(task="语义相似节点检索").exception("业务步骤失败，耗时秒={:.3f}", time.perf_counter() - started)
-            raise
+    def process_batch_node(state: ExperimentState) -> dict[str, Any]:
+        concepts = state["concepts"]
+        start_index = state["concept_index"]
+        batch_end = min(start_index + settings.concept_processing_concurrency, len(concepts))
+        prepared: list[dict[str, Any]] = []
 
-    def reconcile_node(state: ExperimentState) -> dict[str, Any]:
-        concept = state["current_concept"]
-        messages = decision_messages(prompt_catalog, concept["name"], state["candidates"])
-        started = time.perf_counter()
-        logger.bind(task="等价判定与层级关系识别").info("LLM输入={}", json.dumps(messages, ensure_ascii=False))
-        try:
-            response, usage = _invoke_structured(chat_model, DecisionOutput, messages)
-            usage.update({
-                "task": "等价判定与层级关系识别",
-                "trial_index": trial_index,
-                "seed": seed,
-                "concept": concept["name"],
-                "duration_seconds": round(time.perf_counter() - started, 6),
-            })
-            collected_usage.append(usage)
-            logger.bind(task="等价判定与层级关系识别", llm_usage=usage, trial_index=trial_index, seed=seed).info(
-                "LLM调用完成，耗时秒={:.3f}", time.perf_counter() - started
+        # Candidate snapshots for a batch must all observe the same graph state.
+        for concept_index in range(start_index, batch_end):
+            concept = concepts[concept_index]
+            started = time.perf_counter()
+            try:
+                embedding = embedding_model.embed_query(concept["name"])
+                if len(embedding) != settings.embedding_dimensions:
+                    raise ValueError(
+                        f"Embedding has {len(embedding)} dimensions; configured EMBEDDING_DIMENSIONS={settings.embedding_dimensions}"
+                    )
+                candidates = graph_store.candidates(embedding, settings.similarity_top_k)
+                candidates = [
+                    item for item in candidates
+                    if float(item["similarity"]) >= settings.similarity_threshold
+                ]
+                logger.bind(task="语义相似节点检索").info(
+                    "业务输入={} 业务输出={} 耗时秒={:.3f}",
+                    json.dumps({"concept": concept["name"], "top_k": settings.similarity_top_k,
+                                "threshold": settings.similarity_threshold}, ensure_ascii=False),
+                    json.dumps(candidates, ensure_ascii=False),
+                    time.perf_counter() - started,
+                )
+                prepared.append({
+                    "index": concept_index,
+                    "concept": concept,
+                    "embedding": embedding,
+                    "candidates": candidates,
+                })
+            except Exception:
+                logger.bind(task="语义相似节点检索").exception(
+                    "业务步骤失败，耗时秒={:.3f}", time.perf_counter() - started
+                )
+                raise
+
+        def classify(item: dict[str, Any]) -> dict[str, Any]:
+            concept = item["concept"]
+            candidates = item["candidates"]
+            messages = decision_messages(prompt_catalog, concept["name"], candidates)
+            started = time.perf_counter()
+            bound = logger.bind(
+                task="等价判定与层级关系识别",
+                trial_index=trial_index,
+                seed=seed,
+                concept=concept["name"],
             )
-            decision = normalize_decision(response)
-            candidate_ids = {item["concept_id"] for item in state["candidates"]}
-            equivalent = decision["equivalent_to"]
+            bound.info("LLM输入={}", json.dumps(messages, ensure_ascii=False))
+            usage = None
+            try:
+                response, usage = _invoke_structured(chat_model, DecisionOutput, messages)
+                usage.update({
+                    "task": "等价判定与层级关系识别",
+                    "trial_index": trial_index,
+                    "seed": seed,
+                    "concept": concept["name"],
+                    "concept_index": item["index"],
+                    "duration_seconds": round(time.perf_counter() - started, 6),
+                })
+                decision = normalize_decision(response)
+                candidate_ids = {candidate["concept_id"] for candidate in candidates}
+                equivalent = decision["equivalent_to"]
+                target = decision["target_concept_id"]
+                if equivalent is not None and equivalent not in candidate_ids:
+                    raise ValueError(f"LLM returned unknown equivalent candidate: {equivalent}")
+                if target is not None and target not in candidate_ids:
+                    raise ValueError(f"LLM returned unknown relationship candidate: {target}")
+                if equivalent is not None:
+                    decision["target_concept_id"] = equivalent
+                elif decision["relation"] in {"上位", "下位", "相似"} and target is None and candidates:
+                    decision["target_concept_id"] = candidates[0]["concept_id"]
+                logger.bind(task="等价判定与层级关系识别", llm_usage=usage, trial_index=trial_index, seed=seed).info(
+                    "LLM输出={} 耗时秒={:.3f}", json.dumps(decision, ensure_ascii=False), time.perf_counter() - started
+                )
+                return {**item, "decision": decision, "usage": usage, "error": None}
+            except Exception as exc:
+                bound.exception("LLM任务失败，耗时秒={:.3f}", time.perf_counter() - started)
+                if usage is not None:
+                    usage["duration_seconds"] = round(time.perf_counter() - started, 6)
+                return {**item, "usage": usage, "error": exc}
+
+        classified: dict[int, dict[str, Any]] = {}
+        workers = max(1, min(settings.concept_processing_concurrency, len(prepared)))
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="concept-processing") as executor:
+            futures = {executor.submit(classify, item): item["index"] for item in prepared}
+            for future in as_completed(futures):
+                index = futures[future]
+                classified[index] = future.result()
+
+        ordered = [classified[index] for index in range(start_index, batch_end)]
+        batch_usage = [item["usage"] for item in ordered if item["usage"] is not None]
+        collected_usage.extend(batch_usage)
+        failed = next((item["error"] for item in ordered if item["error"] is not None), None)
+        if failed is not None:
+            raise failed
+
+        labels = list(state["labels"])
+        decisions = list(state["decisions"])
+        for item in ordered:
+            current = item["concept"]
+            embedding = item["embedding"]
+            candidates = item["candidates"]
+            decision = item["decision"]
             target = decision["target_concept_id"]
-            if equivalent is not None and equivalent not in candidate_ids:
-                raise ValueError(f"LLM returned unknown equivalent candidate: {equivalent}")
-            if target is not None and target not in candidate_ids:
-                raise ValueError(f"LLM returned unknown relationship candidate: {target}")
-            if equivalent is not None:
-                decision["target_concept_id"] = equivalent
-            elif decision["relation"] in {"上位", "下位", "相似"} and target is None and state["candidates"]:
-                target = state["candidates"][0]["concept_id"]
-                decision["target_concept_id"] = target
-            logger.bind(task="等价判定与层级关系识别", llm_usage=usage, trial_index=trial_index, seed=seed).info(
-                "LLM输出={} 耗时秒={:.3f}", json.dumps(decision, ensure_ascii=False), time.perf_counter() - started
-            )
-            return {"decision": decision, "llm_usage": list(collected_usage)}
-        except Exception:
-            logger.bind(task="等价判定与层级关系识别").exception("LLM任务失败，耗时秒={:.3f}", time.perf_counter() - started)
-            raise
-
-    def update_node(state: ExperimentState) -> dict[str, Any]:
-        current = state["current_concept"]
-        embedding = state["current_embedding"]
-        decision = state["decision"]
-        target = decision["target_concept_id"]
-        concept_id = "concept_" + uuid.uuid5(uuid.NAMESPACE_URL, current["name"].casefold()).hex
-        label = {"concept_id": concept_id, "name": current["name"], "source_post_ids": current["source_post_ids"]}
-        started = time.perf_counter()
-        try:
-            if decision["equivalent_to"] and decision["equivalent_to"] != concept_id:
-                target_candidate = next(item for item in state["candidates"] if item["concept_id"] == decision["equivalent_to"])
-                graph_store.upsert_concept(
-                    Concept(concept_id, current["name"], embedding),
-                    current["source_post_ids"],
-                    settings.neo4j_batch_size,
+            concept_id = "concept_" + uuid.uuid5(uuid.NAMESPACE_URL, current["name"].casefold()).hex
+            label = {"concept_id": concept_id, "name": current["name"], "source_post_ids": current["source_post_ids"]}
+            started = time.perf_counter()
+            try:
+                if decision["equivalent_to"] and decision["equivalent_to"] != concept_id:
+                    target_candidate = next(candidate for candidate in candidates if candidate["concept_id"] == decision["equivalent_to"])
+                    graph_store.upsert_concept(
+                        Concept(concept_id, current["name"], embedding),
+                        current["source_post_ids"],
+                        settings.neo4j_batch_size,
+                    )
+                    graph_store.merge_concept(concept_id, decision["equivalent_to"], settings.neo4j_batch_size)
+                    label = {"concept_id": decision["equivalent_to"], "name": target_candidate["name"],
+                             "source_post_ids": current["source_post_ids"], "merged": True}
+                else:
+                    graph_store.upsert_concept(
+                        Concept(concept_id, current["name"], embedding),
+                        current["source_post_ids"],
+                        settings.neo4j_batch_size,
+                    )
+                    if target and target != concept_id and decision["relation"] in {"上位", "下位", "相似"}:
+                        graph_store.relate(concept_id, target, decision["relation"], decision["reason"], settings.neo4j_batch_size)
+                logger.bind(task="语义网络增量更新").info(
+                    "业务输入={} 业务输出={} 耗时秒={:.3f}",
+                    json.dumps({"concept": current, "decision": decision}, ensure_ascii=False),
+                    json.dumps(label, ensure_ascii=False), time.perf_counter() - started,
                 )
-                graph_store.merge_concept(concept_id, decision["equivalent_to"], settings.neo4j_batch_size)
-                label = {"concept_id": decision["equivalent_to"], "name": target_candidate["name"],
-                         "source_post_ids": current["source_post_ids"], "merged": True}
-            else:
-                concept_record = Concept(concept_id, current["name"], embedding)
-                graph_store.upsert_concept(concept_record, current["source_post_ids"], settings.neo4j_batch_size)
-                if target and target != concept_id and decision["relation"] in {"上位", "下位", "相似"}:
-                    graph_store.relate(concept_id, target, decision["relation"], decision["reason"], settings.neo4j_batch_size)
-            logger.bind(task="语义网络增量更新").info(
-                "业务输入={} 业务输出={} 耗时秒={:.3f}",
-                json.dumps({"concept": current, "decision": decision}, ensure_ascii=False),
-                json.dumps(label, ensure_ascii=False), time.perf_counter() - started,
-            )
-            progress["bar"].update(1)
-            return {
-                "labels": [*state["labels"], label],
-                "decisions": [*state["decisions"], {"concept": current["name"], **decision}],
-                "concept_index": state["concept_index"] + 1,
-            }
-        except Exception:
-            logger.bind(task="语义网络增量更新").exception("业务步骤失败，耗时秒={:.3f}", time.perf_counter() - started)
-            raise
+                labels.append(label)
+                decisions.append({"concept": current["name"], **decision})
+                progress["bar"].update(1)
+            except Exception:
+                logger.bind(task="语义网络增量更新").exception(
+                    "业务步骤失败，耗时秒={:.3f}", time.perf_counter() - started
+                )
+                raise
+
+        return {
+            "labels": labels,
+            "decisions": decisions,
+            "concept_index": batch_end,
+            "llm_usage": list(collected_usage),
+        }
 
     def route(state: ExperimentState) -> str:
-        return "prepare_concept" if state["concept_index"] < len(state["concepts"]) else "finish"
+        return "process_batch" if state["concept_index"] < len(state["concepts"]) else "finish"
 
     def finish_node(state: ExperimentState) -> dict[str, Any]:
         if "bar" in progress:
@@ -370,19 +417,15 @@ def build_experiment_graph(
     builder = StateGraph(ExperimentState)
     builder.add_node("stratified_sampling", sample_node)
     builder.add_node("extract_atomic_concepts", extract_node)
-    builder.add_node("prepare_concept", prepare_node)
-    builder.add_node("classify_equivalence_and_relation", reconcile_node)
-    builder.add_node("incremental_graph_update", update_node)
+    builder.add_node("classify_equivalence_and_relation", process_batch_node)
     builder.add_node("finish", finish_node)
     builder.add_edge(START, "stratified_sampling")
     builder.add_edge("stratified_sampling", "extract_atomic_concepts")
     builder.add_conditional_edges("extract_atomic_concepts", route, {
-        "prepare_concept": "prepare_concept", "finish": "finish",
+        "process_batch": "classify_equivalence_and_relation", "finish": "finish",
     })
-    builder.add_edge("prepare_concept", "classify_equivalence_and_relation")
-    builder.add_edge("classify_equivalence_and_relation", "incremental_graph_update")
-    builder.add_conditional_edges("incremental_graph_update", route, {
-        "prepare_concept": "prepare_concept", "finish": "finish",
+    builder.add_conditional_edges("classify_equivalence_and_relation", route, {
+        "process_batch": "classify_equivalence_and_relation", "finish": "finish",
     })
     builder.add_edge("finish", END)
     return builder.compile()
