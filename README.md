@@ -58,7 +58,9 @@ ID 必须非空且全局唯一，时间必须为 ISO-8601，热度需为数值�
 
 ## 配置
 
-所有超参数可在 `.env` 覆盖，默认值见 `.env.example`：`SAMPLE_SIZE`、`TIME_BINS`、`HOTNESS_BINS`、`SIMILARITY_TOP_K`、`SIMILARITY_THRESHOLD`、`NEO4J_BATCH_SIZE`。模型通过 `API_KEY`、`BASE_URL`、`MODEL`、`TEMPERATURE`、`TIMEOUT`、`MAX_RETRIES` 配置；默认温度为 `0`。`ENABLE_THINKING` 只接受 `true` 或 `false`，默认 `false`；模型名包含 `qwen` 时会作为兼容扩展字段发送，其他模型不会收到该字段。向量服务通过 `EMBEDDING_*` 配置；Neo4j 通过 `NEO4J_*` 配置。
+所有超参数可在 `.env` 覆盖，默认值见 `.env.example`：`SAMPLE_SIZE`、`TIME_BINS`、`HOTNESS_BINS`、`SIMILARITY_TOP_K`、`SIMILARITY_THRESHOLD`、`TARGET_GRANULARITIES`、`NEO4J_BATCH_SIZE`。模型通过 `API_KEY`、`BASE_URL`、`MODEL`、`TEMPERATURE`、`TIMEOUT`、`MAX_RETRIES` 配置；默认温度为 `0`。`ENABLE_THINKING` 只接受 `true` 或 `false`，默认 `false`；模型名包含 `qwen` 时会作为兼容扩展字段发送，其他模型不会收到该字段。向量服务通过 `EMBEDDING_*` 配置；Neo4j 通过 `NEO4J_*` 配置。
+
+全部概念处理完成后，系统按 `下位概念-[:IS_A]->上位概念` 计算当前图谱内的相对颗粒度：没有已识别上位节点的概念为 `0`，其余节点取所有直接上位节点颗粒度的最大值加一。`TARGET_GRANULARITIES` 是非空的非负整数 JSON 数组，默认 `[0]`；`result.json` 的 `target_labels` 只包含指定层级，完整标签仍保留在 `labels`。若上下位图存在环，环内边保留在 Neo4j 中但不参与颗粒度计算，并记录在 `granularity.ignored_cycle_edges`。
 
 概念提取按帖子分别调用模型，`CONCEPT_EXTRACTION_CONCURRENCY` 控制最大并发数，默认 `3`。每篇帖子内先规范化概念，跨帖子再按移除空白并忽略大小写后的名称确定性合并，同时合并来源帖子 ID；不会额外调用 LLM 或 Embedding 做语义近义合并。
 

@@ -44,6 +44,7 @@ class Settings:
     hotness_bins: int
     similarity_top_k: int
     similarity_threshold: float
+    target_granularities: tuple[int, ...]
     neo4j_uri: str
     neo4j_username: str
     neo4j_password: str = field(repr=False)
@@ -140,6 +141,7 @@ def load_settings(env_file: Path | None = None) -> Settings:
         hotness_bins=integer("HOTNESS_BINS", 2),
         similarity_top_k=integer("SIMILARITY_TOP_K", 5),
         similarity_threshold=threshold,
+        target_granularities=parse_target_granularities(os.getenv("TARGET_GRANULARITIES", "[0]")),
         neo4j_uri=os.getenv("NEO4J_URI", "bolt://localhost:7687").strip(),
         neo4j_username=os.getenv("NEO4J_USERNAME", "neo4j").strip(),
         neo4j_password=os.getenv("NEO4J_PASSWORD", "change-this-password"),
@@ -162,3 +164,17 @@ def parse_experiment_seeds(value: str) -> tuple[int, ...]:
     if any(seed < minimum or seed > maximum for seed in parsed):
         raise ValueError("EXPERIMENT_SEEDS values must fit in a signed 64-bit integer")
     return tuple(parsed)
+
+
+def parse_target_granularities(value: str) -> tuple[int, ...]:
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError("TARGET_GRANULARITIES must be a JSON array of non-negative integers") from exc
+    if not isinstance(parsed, list) or not parsed:
+        raise ValueError("TARGET_GRANULARITIES must be a non-empty JSON array")
+    if any(isinstance(item, bool) or not isinstance(item, int) for item in parsed):
+        raise ValueError("TARGET_GRANULARITIES must contain only integers")
+    if any(item < 0 for item in parsed):
+        raise ValueError("TARGET_GRANULARITIES values must be >= 0")
+    return tuple(sorted(set(parsed)))

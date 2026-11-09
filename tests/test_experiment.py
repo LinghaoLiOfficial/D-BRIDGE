@@ -15,7 +15,13 @@ import pandas as pd
 from loguru import logger
 from neo4j.exceptions import AuthError
 
-from d_bridge.config import Settings, load_settings, parse_experiment_seeds, validate_http_url
+from d_bridge.config import (
+    Settings,
+    load_settings,
+    parse_experiment_seeds,
+    parse_target_granularities,
+    validate_http_url,
+)
 from d_bridge.data import Post, load_posts
 from d_bridge.prompts import (
     ConceptsOutput,
@@ -189,6 +195,7 @@ class MemoryGraphStore:
         self.nodes = {}
         self.posts = {}
         self.relationships = []
+        self.granularities = {}
         self.candidate_snapshots = []
         self.closed = False
         self.reset_calls = 0
@@ -198,6 +205,7 @@ class MemoryGraphStore:
         self.nodes.clear()
         self.posts.clear()
         self.relationships.clear()
+        self.granularities.clear()
 
     def candidates(self, _embedding, _top_k):
         self.candidate_snapshots.append(list(self.nodes))
@@ -222,11 +230,31 @@ class MemoryGraphStore:
         self.relationships.append((source_id, "EQUIVALENT_TO", target_id))
 
     def relate(self, source_id, target_id, relation, reason, _batch_size):
+        if relation == "上位":
+            source_id, target_id = target_id, source_id
         self.relationships.append((source_id, relation, target_id, reason))
+
+    def hierarchy(self):
+        return list(self.nodes), [
+            (item[0], item[2])
+            for item in self.relationships
+            if len(item) == 4 and item[1] in {"上位", "下位"}
+        ]
+
+    def set_granularities(self, granularities, batch_size):
+        assert batch_size > 0
+        self.granularities = dict(granularities)
 
     def export(self):
         return {
-            "concepts": list(self.nodes),
+            "concepts": [
+                {
+                    "concept_id": concept.concept_id,
+                    "name": concept.name,
+                    "granularity": self.granularities.get(concept.concept_id),
+                }
+                for concept in self.nodes.values()
+            ],
             "posts": list(self.posts.values()),
             "relationships": self.relationships,
         }
@@ -279,6 +307,7 @@ def settings(**overrides):
         hotness_bins=2,
         similarity_top_k=5,
         similarity_threshold=0.35,
+        target_granularities=(0,),
         neo4j_uri="bolt://localhost:7687",
         neo4j_username="neo4j",
         neo4j_password="secret-password",
@@ -300,6 +329,13 @@ def test_load_sample_json_and_validate_records(tmp_path):
     (bad_dir / "bad.json").write_text(json.dumps({"post_id": "x"}), encoding="utf-8")
     with pytest.raises(ValueError, match="missing"):
         load_posts(bad_dir)
+
+
+def test_target_granularities_are_validated_and_normalized():
+    assert parse_target_granularities("[2, 0, 2, 1]") == (0, 1, 2)
+    for invalid in ("[]", "[-1]", "[true]", "[1.5]", '["1"]', "not-json"):
+        with pytest.raises(ValueError, match="TARGET_GRANULARITIES"):
+            parse_target_granularities(invalid)
 
 
 def test_load_posts_preserves_extra_properties(tmp_path):
@@ -503,6 +539,7 @@ def test_langgraph_runs_real_model_nodes_and_relationship_branches():
     node_names = set(graph.get_graph().nodes)
     assert "extract_atomic_concepts" in node_names
     assert "classify_equivalence_and_relation" in node_names
+    assert "assign_granularity" in node_names
 
     state = graph.invoke({"posts": [
         {"post_id": "p1", "created_at": "2026-01-01T00:00:00+00:00", "hotness": 4, "text": "公共交通"},
@@ -511,6 +548,9 @@ def test_langgraph_runs_real_model_nodes_and_relationship_branches():
     assert chat.calls == 4  # one extraction per post plus one decision per merged concept
     assert state["llm_usage"][0]["total_tokens"] == 15
     assert len(state["labels"]) == 2
+    assert [item["granularity"] for item in state["labels"]] == [0, 1]
+    assert [item["name"] for item in state["target_labels"]] == ["公共交通"]
+    assert state["granularity"]["distribution"] == {"0": 2, "1": 1}
     assert store.posts["p1"]["text"] == "公共交通"
     assert store.posts["p1"]["hotness"] == 4.0
     assert any(item[1] == "下位" for item in store.relationships)
@@ -654,6 +694,37 @@ def test_equivalent_decision_merges_into_canonical_candidate():
     assert any(item[1] == "EQUIVALENT_TO" for item in store.relationships)
 
 
+def test_target_labels_deduplicate_canonical_concepts_and_merge_sources():
+    config = settings(sample_size=2)
+    store = MemoryGraphStore()
+    store.upsert_concept(Concept("canonical", "共享单车", [1.0, 0.0]), [], 10)
+    chat = FakeChatModel(
+        {"concepts": [
+            {"name": "共享自行车", "source_post_ids": ["wrong"]},
+            {"name": "公共自行车", "source_post_ids": ["wrong"]},
+        ]},
+        [
+            {"equivalent_to": "canonical", "target_concept_id": "canonical", "relation": "相似", "reason": "同义"},
+            {"equivalent_to": "canonical", "target_concept_id": "canonical", "relation": "相似", "reason": "同义"},
+        ],
+    )
+    graph = build_experiment_graph(
+        config, chat, FakeEmbeddings(), store, CaptureLogger(), load_prompt_catalog(config.prompt_template_path)
+    )
+
+    state = graph.invoke({"posts": [
+        {"post_id": "p1", "created_at": "2026-01-01T00:00:00+00:00", "hotness": 4, "text": "共享自行车"},
+        {"post_id": "p2", "created_at": "2026-01-02T00:00:00+00:00", "hotness": 5, "text": "公共自行车"},
+    ]})
+
+    assert state["target_labels"] == [{
+        "concept_id": "canonical",
+        "name": "共享单车",
+        "granularity": 0,
+        "source_post_ids": ["p1", "p2"],
+    }]
+
+
 def test_missing_provider_usage_is_explicitly_marked_unavailable():
     config = settings()
     store = MemoryGraphStore()
@@ -722,6 +793,7 @@ def test_thinking_and_extraction_concurrency_defaults(tmp_path, monkeypatch):
     monkeypatch.delenv("ENABLE_THINKING", raising=False)
     monkeypatch.delenv("CONCEPT_EXTRACTION_CONCURRENCY", raising=False)
     monkeypatch.delenv("CONCEPT_PROCESSING_CONCURRENCY", raising=False)
+    monkeypatch.delenv("TARGET_GRANULARITIES", raising=False)
     env_file = tmp_path / "defaults.env"
     env_file.write_text(
         "\n".join([
@@ -738,6 +810,7 @@ def test_thinking_and_extraction_concurrency_defaults(tmp_path, monkeypatch):
     loaded = load_settings(env_file)
 
     assert loaded.enable_thinking is False
+    assert loaded.target_granularities == (0,)
     assert loaded.concept_extraction_concurrency == 3
     assert loaded.concept_processing_concurrency == 3
 
@@ -895,6 +968,15 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     assert sampling["strata"][0]["population_count"] == 1
     assert sampling["strata"][0]["sampled_count"] == 1
     assert len(result["labels"]) == 1
+    assert result["labels"][0]["granularity"] == 0
+    assert result["target_labels"] == [{
+        "concept_id": result["labels"][0]["concept_id"],
+        "name": "城市骑行",
+        "granularity": 0,
+        "source_post_ids": ["p1"],
+    }]
+    assert result["granularity"]["distribution"] == {"0": 1}
+    assert result["graph"]["concepts"][0]["granularity"] == 0
     assert result["graph"]["posts"][0]["text"] == "城市骑行"
     assert result["prompt_templates"]["snapshot_file"] == "prompts.json"
     assert result["prompt_templates"]["versions"] == {
@@ -915,6 +997,7 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     }
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["stability"]["status"] == "insufficient_samples"
+    assert "target_labels" in summary["stability"]
     assert summary["sampling"]["overall_coverage_rate"] == {
         "average": 1.0, "minimum": 1.0, "maximum": 1.0,
     }

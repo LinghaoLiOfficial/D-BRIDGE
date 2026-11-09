@@ -23,6 +23,8 @@ class GraphStore(Protocol):
     def upsert_concept(self, concept: Concept, source_post_ids: list[str], batch_size: int) -> None: ...
     def merge_concept(self, source_id: str, target_id: str, batch_size: int) -> None: ...
     def relate(self, source_id: str, target_id: str, relation: str, reason: str, batch_size: int) -> None: ...
+    def hierarchy(self) -> tuple[list[str], list[tuple[str, str]]]: ...
+    def set_granularities(self, granularities: dict[str, int], batch_size: int) -> None: ...
     def export(self) -> dict[str, list[dict[str, Any]]]: ...
     def close(self) -> None: ...
 
@@ -189,10 +191,40 @@ class Neo4jStore:
                 reason=reason,
             ).consume()
 
+    def hierarchy(self) -> tuple[list[str], list[tuple[str, str]]]:
+        with self.driver.session(database=self.database) as session:
+            concept_ids = [row["concept_id"] for row in session.run(
+                "MATCH (c:Concept) RETURN c.concept_id AS concept_id ORDER BY concept_id"
+            )]
+            edges = [
+                (row["source_id"], row["target_id"])
+                for row in session.run(
+                    "MATCH (child:Concept)-[:IS_A]->(parent:Concept) "
+                    "RETURN child.concept_id AS source_id, parent.concept_id AS target_id "
+                    "ORDER BY source_id, target_id"
+                )
+            ]
+            return concept_ids, edges
+
+    def set_granularities(self, granularities: dict[str, int], batch_size: int) -> None:
+        records = [
+            {"concept_id": concept_id, "granularity": granularity}
+            for concept_id, granularity in sorted(granularities.items())
+        ]
+        with self.driver.session(database=self.database) as session:
+            for index in range(0, len(records), batch_size):
+                session.run(
+                    "UNWIND $concepts AS concept "
+                    "MATCH (c:Concept {concept_id: concept.concept_id}) "
+                    "SET c.granularity = concept.granularity, c.updated_at = datetime()",
+                    concepts=records[index:index + batch_size],
+                ).consume()
+
     def export(self) -> dict[str, list[dict[str, Any]]]:
         with self.driver.session(database=self.database) as session:
             nodes = [dict(row) for row in session.run(
                 "MATCH (c:Concept) RETURN c.concept_id AS concept_id, c.name AS name, c.aliases AS aliases, "
+                "c.granularity AS granularity, "
                 "c.embedding AS embedding, toString(c.created_at) AS created_at, toString(c.updated_at) AS updated_at "
                 "ORDER BY concept_id"
             )]

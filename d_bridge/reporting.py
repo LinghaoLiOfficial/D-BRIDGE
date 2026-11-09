@@ -33,6 +33,14 @@ def _labels(output: dict[str, Any]) -> set[Hashable]:
     }
 
 
+def _target_labels(output: dict[str, Any]) -> set[Hashable]:
+    return {
+        (item.get("concept_id"), item.get("name"), item.get("granularity"))
+        for item in output.get("target_labels", [])
+        if item.get("concept_id") or item.get("name")
+    }
+
+
 def _relationships(output: dict[str, Any]) -> set[Hashable]:
     relationships = output.get("graph", {}).get("relationships", [])
     normalized: set[Hashable] = set()
@@ -85,6 +93,7 @@ def stability_report(trials: list[tuple[int, dict[str, Any]]]) -> dict[str, Any]
         "comparison_pairs": comparison_pairs,
         "concepts": _metric(trials, _concepts),
         "labels": _metric(trials, _labels),
+        "target_labels": _metric(trials, _target_labels),
         "relationships": _metric(trials, _relationships),
     }
 

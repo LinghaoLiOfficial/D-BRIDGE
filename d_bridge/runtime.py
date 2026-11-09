@@ -251,6 +251,8 @@ def run_experiment(
                     "sampling": trial_sampling_report,
                     "concepts": final_state.get("concepts", []),
                     "labels": final_state.get("labels", []),
+                    "target_labels": final_state.get("target_labels", []),
+                    "granularity": final_state.get("granularity", {}),
                     "decisions": final_state.get("decisions", []),
                     "graph": graph_export,
                     "prompt_templates": prompt_summary,
@@ -275,7 +277,8 @@ def run_experiment(
                     },
                 })
                 logger.bind(trial_index=trial_index, seed=seed).info(
-                    "Trial completed: concepts={}, labels={}", len(output["concepts"]), len(output["labels"])
+                    "Trial completed: concepts={}, labels={}, target_labels={}",
+                    len(output["concepts"]), len(output["labels"]), len(output["target_labels"])
                 )
             except Exception as exc:
                 batch_usage_events.extend(trial_usage_events)

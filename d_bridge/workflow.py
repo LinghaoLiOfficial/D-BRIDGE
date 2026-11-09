@@ -13,6 +13,7 @@ from tqdm import tqdm
 
 from .config import Settings
 from .data import Post
+from .granularity import compute_granularities
 from .prompts import (
     DecisionOutput,
     ConceptsOutput,
@@ -36,6 +37,8 @@ class ExperimentState(TypedDict, total=False):
     candidates: list[dict[str, Any]]
     decision: dict[str, Any]
     labels: list[dict[str, Any]]
+    target_labels: list[dict[str, Any]]
+    granularity: dict[str, Any]
     decisions: list[dict[str, Any]]
     llm_usage: list[dict[str, Any]]
     sampling_report: dict[str, Any]
@@ -407,7 +410,52 @@ def build_experiment_graph(
         }
 
     def route(state: ExperimentState) -> str:
-        return "process_batch" if state["concept_index"] < len(state["concepts"]) else "finish"
+        return "process_batch" if state["concept_index"] < len(state["concepts"]) else "assign_granularity"
+
+    def assign_granularity_node(state: ExperimentState) -> dict[str, Any]:
+        started = time.perf_counter()
+        concept_ids, hierarchy_edges = graph_store.hierarchy()
+        result = compute_granularities(concept_ids, hierarchy_edges)
+        graph_store.set_granularities(result.granularities, settings.neo4j_batch_size)
+
+        labels = [
+            {**label, "granularity": result.granularities[label["concept_id"]]}
+            for label in state["labels"]
+        ]
+        canonical: dict[str, dict[str, Any]] = {}
+        for label in labels:
+            concept_id = label["concept_id"]
+            if concept_id not in canonical:
+                canonical[concept_id] = {
+                    "concept_id": concept_id,
+                    "name": label["name"],
+                    "granularity": label["granularity"],
+                    "source_post_ids": set(),
+                }
+            canonical[concept_id]["source_post_ids"].update(label.get("source_post_ids", []))
+        target_granularities = set(settings.target_granularities)
+        target_labels = [
+            {
+                **{key: value for key, value in canonical[concept_id].items() if key != "source_post_ids"},
+                "source_post_ids": sorted(canonical[concept_id]["source_post_ids"]),
+            }
+            for concept_id in sorted(canonical)
+            if canonical[concept_id]["granularity"] in target_granularities
+        ]
+        report = {
+            "target_granularities": list(settings.target_granularities),
+            "node_count": len(result.granularities),
+            "distribution": result.distribution,
+            "ignored_cycle_edge_count": len(result.ignored_cycle_edges),
+            "ignored_cycle_edges": result.ignored_cycle_edges,
+        }
+        logger.bind(task="关键词颗粒度标注", granularity_report=report).info(
+            "业务输入={} 业务输出={} 耗时秒={:.3f}",
+            json.dumps({"concept_count": len(concept_ids), "hierarchy_edge_count": len(hierarchy_edges)}, ensure_ascii=False),
+            json.dumps(report, ensure_ascii=False),
+            time.perf_counter() - started,
+        )
+        return {"labels": labels, "target_labels": target_labels, "granularity": report}
 
     def finish_node(state: ExperimentState) -> dict[str, Any]:
         if "bar" in progress:
@@ -418,14 +466,16 @@ def build_experiment_graph(
     builder.add_node("stratified_sampling", sample_node)
     builder.add_node("extract_atomic_concepts", extract_node)
     builder.add_node("classify_equivalence_and_relation", process_batch_node)
+    builder.add_node("assign_granularity", assign_granularity_node)
     builder.add_node("finish", finish_node)
     builder.add_edge(START, "stratified_sampling")
     builder.add_edge("stratified_sampling", "extract_atomic_concepts")
     builder.add_conditional_edges("extract_atomic_concepts", route, {
-        "process_batch": "classify_equivalence_and_relation", "finish": "finish",
+        "process_batch": "classify_equivalence_and_relation", "assign_granularity": "assign_granularity",
     })
     builder.add_conditional_edges("classify_equivalence_and_relation", route, {
-        "process_batch": "classify_equivalence_and_relation", "finish": "finish",
+        "process_batch": "classify_equivalence_and_relation", "assign_granularity": "assign_granularity",
     })
+    builder.add_edge("assign_granularity", "finish")
     builder.add_edge("finish", END)
     return builder.compile()
