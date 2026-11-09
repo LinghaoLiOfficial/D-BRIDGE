@@ -444,8 +444,11 @@ def test_default_prompt_catalog_loads_and_renders_json_inputs():
     extraction = extraction_messages(catalog, [{"post_id": "p1", "text": "城市骑行"}])
     decision = decision_messages(catalog, "城市骑行", [{"concept_id": "c1", "name": "骑行"}])
 
-    assert catalog.templates["concept_extraction"].version == "1.1.0"
+    assert catalog.templates["concept_extraction"].version == "1.2.0"
     assert '"post_id": "p1"' in extraction[1][1]
+    assert "企业名称、品牌名称、人名及其他专有实体名称都不是主题关键词" in extraction[0][1]
+    assert "排除“某企业”“某品牌”“张三”" in extraction[1][1]
+    assert "保留“售后服务”“续航下降”“充电故障”“价格补偿”" in extraction[1][1]
     assert '"new_concept": "城市骑行"' in decision[1][1]
     assert '"concept_id": "c1"' in decision[1][1]
 
@@ -879,7 +882,7 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     assert "secret-embedding-key" not in saved_config
     assert "secret-password" not in saved_config
     saved_prompts = json.loads((run_dir / "prompts.json").read_text(encoding="utf-8"))
-    assert saved_prompts["templates"]["concept_extraction"]["version"] == "1.1.0"
+    assert saved_prompts["templates"]["concept_extraction"]["version"] == "1.2.0"
     assert "secret-key" not in json.dumps(saved_prompts)
     trial_dir = next((run_dir / "trials").iterdir())
     result = json.loads((trial_dir / "result.json").read_text(encoding="utf-8"))
@@ -895,7 +898,7 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     assert result["graph"]["posts"][0]["text"] == "城市骑行"
     assert result["prompt_templates"]["snapshot_file"] == "prompts.json"
     assert result["prompt_templates"]["versions"] == {
-        "concept_extraction": "1.1.0",
+        "concept_extraction": "1.2.0",
         "relation_decision": "1.0.0",
     }
     config_snapshot = json.loads(saved_config)
