@@ -1,4 +1,4 @@
-from d_bridge.granularity import compute_granularities
+from d_bridge.modules.hisg.granularity import compute_granularities
 
 
 def test_granularity_uses_longest_path_across_roots_and_parents():

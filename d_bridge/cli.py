@@ -4,12 +4,19 @@ import argparse
 import sys
 from pathlib import Path
 
-from .config import load_settings
-from .runtime import run_experiment
+from .modules.hisg.config import load_settings
+from .modules.hisg.runtime import run_experiment
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the hierarchical incremental semantic label network experiment.")
+    parser = argparse.ArgumentParser(description="Run a D-BRIDGE experiment module.")
+    parser.add_argument(
+        "module",
+        nargs="?",
+        default="hisg",
+        choices=("hisg",),
+        help="Experiment module to run (default: hisg).",
+    )
     parser.add_argument("--data-dir", type=Path, help="Directory containing input JSON post data (defaults to DATA_DIR).")
     parser.add_argument("--env-file", type=Path, default=Path(".env"), help="Environment configuration file (default: .env).")
     return parser

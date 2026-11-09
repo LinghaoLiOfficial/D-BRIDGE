@@ -28,7 +28,7 @@ neo4j-reset:
 	$(COMPOSE_WITH_ENV) up -d --wait neo4j
 
 run: neo4j
-	$(UV) run d-bridge --data-dir "$(DATA_DIR)" --env-file "$(ENV_FILE)"
+	$(UV) run d-bridge hisg --data-dir "$(DATA_DIR)" --env-file "$(ENV_FILE)"
 
 stop:
 	$(COMPOSE_WITH_ENV) stop neo4j

@@ -19,6 +19,9 @@ from .reporting import aggregate_usage, sampling_summary, stability_report
 from .storage import Neo4jStore
 from .workflow import build_experiment_graph
 
+MODULE_ID = "hisg"
+MODULE_NAME = "HISG Builder"
+
 
 def create_run_directory(result_root: Path, now: datetime | None = None) -> Path:
     timestamp = (now or datetime.now().astimezone()).strftime("%Y%m%d_%H%M%S_%f")
@@ -117,6 +120,8 @@ def _summary(
     started: float,
 ) -> dict[str, Any]:
     return {
+        "module": MODULE_ID,
+        "module_name": MODULE_NAME,
         "status": status,
         "requested_trials": len(seeds),
         "completed_trials": sum(item["status"] == "completed" for item in trials),
@@ -149,7 +154,9 @@ def run_experiment(
         raise ValueError("Provide graph_store or graph_store_factory, not both")
 
     batch_started = time.perf_counter()
-    run_dir = create_run_directory(settings.result_dir)
+    task_dir = create_run_directory(settings.result_dir)
+    run_dir = task_dir / MODULE_ID
+    run_dir.mkdir(exist_ok=False)
     root_sink_ids = setup_run_logging(run_dir)
     logger.info("Batch directory: {}", run_dir)
     store = None
@@ -167,6 +174,8 @@ def run_experiment(
         _write_json(run_dir / "input_posts.json", serialized_posts)
 
         config_snapshot = settings.public_dict()
+        config_snapshot["module"] = MODULE_ID
+        config_snapshot["module_name"] = MODULE_NAME
         config_snapshot["data_dir"] = str(data_dir or settings.data_dir)
         config_snapshot["prompt_templates"] = {
             "source_path": str(settings.prompt_template_path),
@@ -241,6 +250,8 @@ def run_experiment(
                 graph_export = store.export()
                 usage_events = trial_usage_events
                 output = {
+                    "module": MODULE_ID,
+                    "module_name": MODULE_NAME,
                     "trial": {
                         "index": trial_index,
                         "seed": seed,

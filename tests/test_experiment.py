@@ -15,15 +15,15 @@ import pandas as pd
 from loguru import logger
 from neo4j.exceptions import AuthError
 
-from d_bridge.config import (
+from d_bridge.modules.hisg.config import (
     Settings,
     load_settings,
     parse_experiment_seeds,
     parse_target_granularities,
     validate_http_url,
 )
-from d_bridge.data import Post, load_posts
-from d_bridge.prompts import (
+from d_bridge.modules.hisg.data import Post, load_posts
+from d_bridge.modules.hisg.prompts import (
     ConceptsOutput,
     DecisionOutput,
     decision_messages,
@@ -32,12 +32,12 @@ from d_bridge.prompts import (
     normalize_concepts,
     normalize_decision,
 )
-from d_bridge.randomness import initialize_random_state
-from d_bridge.reporting import stability_report
-from d_bridge.runtime import create_chat_model, create_embedding_model, create_run_directory, run_experiment
-from d_bridge.sampling import stratified_sample
-from d_bridge.storage import Concept, Neo4jStore
-from d_bridge.workflow import build_experiment_graph
+from d_bridge.modules.hisg.randomness import initialize_random_state
+from d_bridge.modules.hisg.reporting import stability_report
+from d_bridge.modules.hisg.runtime import create_chat_model, create_embedding_model, create_run_directory, run_experiment
+from d_bridge.modules.hisg.sampling import stratified_sample
+from d_bridge.modules.hisg.storage import Concept, Neo4jStore
+from d_bridge.modules.hisg.workflow import build_experiment_graph
 
 
 class FakeChatModel:
@@ -887,7 +887,7 @@ def test_neo4j_auth_failure_has_actionable_error_and_closes_driver(monkeypatch):
             self.closed = True
 
     driver = RejectingDriver()
-    monkeypatch.setattr("d_bridge.storage.GraphDatabase.driver", lambda *_args, **_kwargs: driver)
+    monkeypatch.setattr("d_bridge.modules.hisg.storage.GraphDatabase.driver", lambda *_args, **_kwargs: driver)
 
     with pytest.raises(RuntimeError, match="make neo4j-reset"):
         Neo4jStore("bolt://localhost:7687", "neo4j", "wrong", "neo4j", 2)
@@ -948,6 +948,10 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
 
     run_dir = run_experiment(config, chat_model=chat, embedding_model=FakeEmbeddings(), graph_store=store)
 
+    assert run_dir.name == "hisg"
+    assert run_dir.parent.parent == config.result_dir
+    assert list(config.result_dir.iterdir()) == [run_dir.parent]
+    assert list(run_dir.parent.iterdir()) == [run_dir]
     generated_files = {path.name for path in run_dir.iterdir()}
     assert {"config.json", "prompts.json", "input_posts.json", "experiment.log", "summary.json", "trials"} <= generated_files
     saved_config = (run_dir / "config.json").read_text(encoding="utf-8")
@@ -961,6 +965,8 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     result = json.loads((trial_dir / "result.json").read_text(encoding="utf-8"))
     sampling = json.loads((trial_dir / "sampling.json").read_text(encoding="utf-8"))
     assert result["sampled_posts"][0]["post_id"] == "p1"
+    assert result["module"] == "hisg"
+    assert result["module_name"] == "HISG Builder"
     assert result["sampling"] == sampling
     assert sampling["population_size"] == 1
     assert sampling["actual_sample_size"] == 1
@@ -984,6 +990,8 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
         "relation_decision": "1.0.0",
     }
     config_snapshot = json.loads(saved_config)
+    assert config_snapshot["module"] == "hisg"
+    assert config_snapshot["module_name"] == "HISG Builder"
     assert config_snapshot["prompt_templates"]["source_path"] == str(config.prompt_template_path)
     assert config_snapshot["prompt_templates"]["versions"] == result["prompt_templates"]["versions"]
     assert result["trial"]["seed"] == 42
@@ -996,6 +1004,8 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
         "total_tokens": 30,
     }
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
+    assert summary["module"] == "hisg"
+    assert summary["module_name"] == "HISG Builder"
     assert summary["stability"]["status"] == "insufficient_samples"
     assert "target_labels" in summary["stability"]
     assert summary["sampling"]["overall_coverage_rate"] == {
@@ -1065,7 +1075,7 @@ def test_prompt_snapshot_survives_a_later_model_failure(tmp_path):
             graph_store=MemoryGraphStore(),
         )
 
-    run_dirs = list(config.result_dir.iterdir())
+    run_dirs = [task_dir / "hisg" for task_dir in config.result_dir.iterdir()]
     assert len(run_dirs) == 1
     assert (run_dirs[0] / "prompts.json").is_file()
     assert (run_dirs[0] / "config.json").is_file()
@@ -1150,7 +1160,7 @@ def test_failed_trial_stops_remaining_seeds_and_clears_graph(tmp_path):
     assert created_seeds == [1, 2]
     assert store.reset_calls == 3  # two trial starts plus failed-trial cleanup
     assert not store.nodes and not store.posts
-    run_dir = next(config.result_dir.iterdir())
+    run_dir = next(config.result_dir.iterdir()) / "hisg"
     summary = json.loads((run_dir / "summary.json").read_text(encoding="utf-8"))
     assert summary["completed_trials"] == 1
     assert summary["failed_trials"] == 1

@@ -1,6 +1,6 @@
-# D-BRIDGE 语义标签网络实验
+# D-BRIDGE 实验框架：HISG Builder
 
-本项目按 `docs/202611061622` 的设计实现层次化、增量式语义标签网络构建：时间与热度联合分层抽样、LLM 原子概念提取、Embedding 相似节点检索、LLM 等价/层级关系判定，以及 Neo4j 图谱增量写入。正式实验会真实调用 `.env` 中配置的聊天模型和 Embedding 服务。
+当前仓库实现 D-BRIDGE 的首个实验模块 **HISG Builder**（Hierarchical Incremental Semantic Graph Builder）。HISG 按 `docs/202611061622` 的设计实现层次化、增量式语义标签网络构建：时间与热度联合分层抽样、LLM 原子概念提取、Embedding 相似节点检索、LLM 等价/层级关系判定，以及 Neo4j 图谱增量写入。正式实验会真实调用 `.env` 中配置的聊天模型和 Embedding 服务。
 
 ## 环境准备
 
@@ -22,6 +22,13 @@ make install
 make run
 ```
 
+根 CLI 支持显式选择 HISG；为兼容既有命令，省略模块名时仍默认运行 HISG：
+
+```bash
+uv run d-bridge hisg --env-file .env --data-dir data
+uv run d-bridge --env-file .env --data-dir data
+```
+
 `make run` 会自动启动 Neo4j，等待 healthcheck 通过后运行实验。需要指定输入目录或环境文件时可使用：
 
 ```bash
@@ -30,9 +37,9 @@ DATA_DIR=data ENV_FILE=.env make run
 
 也可以单独管理服务：`make neo4j` 启动并等待 Neo4j，`make stop` 停止容器，`make test` 运行离线测试。`make run` 会让 Compose 和 Python 都以 `ENV_FILE` 为配置来源，避免终端中残留的同名环境变量造成两边凭据不一致。
 
-默认示例位于 `data/posts.json`，包含 20 条可复现的新能源车企模拟舆情，兼有正面、负面及混合观点。每次运行会在 `result/<本地时间戳>/` 新建批次目录，生成：
+默认示例位于 `data/posts.json`，包含 20 条可复现的新能源车企模拟舆情，兼有正面、负面及混合观点。每次运行先在 `RESULT_DIR`（默认 `result`）下创建时间戳任务目录，再将 HISG 产物写入 `result/<本地时间戳>/hisg/`。时间戳目录作为任务容器，为其他模块的并列结果预留位置；当前 CLI 每次运行创建独立任务。已有历史结果不会移动或重写。HISG 模块目录内生成：
 
-- `config.json`：本次公开实验参数快照，不包含 API key、Embedding key 或数据库密码。
+- `config.json`：本次公开实验参数快照，包含 `module: "hisg"` 和 `module_name: "HISG Builder"`，不包含 API key、Embedding key 或数据库密码。
 - `prompts.json`：本次实际使用的完整提示词模板快照及各模板版本。
 - `input_posts.json`：本批次实际加载的规范化输入快照。
 - `experiment.log`：批次级结构化 Loguru 日志。
