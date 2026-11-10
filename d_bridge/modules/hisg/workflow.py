@@ -22,6 +22,7 @@ from .prompts import (
     extraction_messages,
     normalize_concepts,
     normalize_decision,
+    resolve_decision,
 )
 from .sampling import stratified_sample
 from .storage import Concept, GraphStore
@@ -321,20 +322,13 @@ def build_experiment_graph(
                     "concept_index": item["index"],
                     "duration_seconds": round(time.perf_counter() - started, 6),
                 })
-                decision = normalize_decision(response)
-                candidate_ids = {candidate["concept_id"] for candidate in candidates}
-                equivalent = decision["equivalent_to"]
-                target = decision["target_concept_id"]
-                if equivalent is not None and equivalent not in candidate_ids:
-                    raise ValueError(f"LLM returned unknown equivalent risk candidate: {equivalent}")
-                if target is not None and target not in candidate_ids:
-                    raise ValueError(f"LLM returned unknown risk relationship candidate: {target}")
-                if equivalent is not None:
-                    decision["target_concept_id"] = equivalent
-                elif decision["relation"] in {"上位", "下位", "相似"} and target is None and candidates:
-                    decision["target_concept_id"] = candidates[0]["concept_id"]
+                semantic_decision = normalize_decision(response)
+                decision = resolve_decision(semantic_decision, candidates)
                 logger.bind(task="风险等价与类别层级关系识别", llm_usage=usage, trial_index=trial_index, seed=seed).info(
-                    "LLM输出={} 耗时秒={:.3f}", json.dumps(decision, ensure_ascii=False), time.perf_counter() - started
+                    "LLM语义输出={} 映射决策={} 耗时秒={:.3f}",
+                    json.dumps(semantic_decision, ensure_ascii=False),
+                    json.dumps(decision, ensure_ascii=False),
+                    time.perf_counter() - started,
                 )
                 return {**item, "decision": decision, "usage": usage, "error": None}
             except Exception as exc:

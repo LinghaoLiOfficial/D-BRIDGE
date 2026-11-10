@@ -31,6 +31,7 @@ from d_bridge.modules.hisg.prompts import (
     load_prompt_catalog,
     normalize_concepts,
     normalize_decision,
+    resolve_decision,
 )
 from d_bridge.modules.hisg.randomness import initialize_random_state
 from d_bridge.modules.hisg.reporting import stability_report
@@ -48,14 +49,16 @@ class FakeChatModel:
         self.messages = []
         self.include_raw = False
         self.include_usage = include_usage
+        self.schema = None
         self.lock = threading.Lock()
 
-    def with_structured_output(self, _schema, *, include_raw=False):
+    def with_structured_output(self, schema, *, include_raw=False):
         self.include_raw = include_raw
+        self.schema = schema
         return self
 
     def invoke(self, messages):
-        is_extraction = any("post_id（来源标识）" in str(message.content) for message in messages)
+        is_extraction = self.schema is ConceptsOutput
         with self.lock:
             self.calls += 1
             call_number = self.calls
@@ -98,7 +101,11 @@ class ConcurrentChatModel:
             call_number = self.calls
         if schema is ConceptsOutput:
             human = messages[-1].content
-            post_id = next(post_id for post_id in ("p1", "p2", "p3") if f'"{post_id}"' in human)
+            post_id = next(
+                post_id
+                for post_id, text in (("p1", "第一篇"), ("p2", "第二篇"), ("p3", "第三篇"))
+                if text in human
+            )
             with self.lock:
                 self.active_extractions += 1
                 self.max_active_extractions = max(self.max_active_extractions, self.active_extractions)
@@ -108,14 +115,14 @@ class ConcurrentChatModel:
                 if post_id == self.fail_post_id:
                     raise RuntimeError(f"failed extraction for {post_id}")
                 name = {"p1": "EV 充电", "p2": " ev充电 ", "p3": "Ev充 电"}[post_id]
-                parsed = {"concepts": [{"name": name, "source_post_ids": ["wrong-post"]}]}
+                parsed = {"concepts": [{"name": name}]}
             finally:
                 with self.lock:
                     self.active_extractions -= 1
         else:
             parsed = {
-                "equivalent_to": None,
-                "target_concept_id": None,
+                "equivalent_candidate_number": None,
+                "target_candidate_number": None,
                 "relation": "无关",
                 "reason": "无候选",
             }
@@ -150,7 +157,7 @@ class ConcurrentDecisionChatModel:
         human = messages[-1].content
         if schema is ConceptsOutput:
             parsed = {"concepts": [
-                {"name": f"概念{i}", "source_post_ids": ["wrong"]}
+                {"name": f"概念{i}"}
                 for i in range(1, 5)
             ]}
             call_number = 1
@@ -167,8 +174,8 @@ class ConcurrentDecisionChatModel:
                 if concept == self.fail_concept:
                     raise RuntimeError(f"failed decision for {concept}")
                 parsed = {
-                    "equivalent_to": None,
-                    "target_concept_id": None,
+                    "equivalent_candidate_number": None,
+                    "target_candidate_number": None,
                     "relation": "无关",
                     "reason": "无候选",
                 }
@@ -466,23 +473,116 @@ def test_prompt_response_normalization_and_validation():
         {"name": "共享单车", "source_post_ids": ["p1"]},
         {"name": "共享单车", "source_post_ids": ["p2"]},
     ]})
-    assert concepts == [{"name": "共享单车", "source_post_ids": ["p1", "p2"]}]
-    assert normalize_decision({
-        "equivalent_to": "c1", "target_concept_id": "c1", "relation": "无关", "reason": "同义词"
-    })["equivalent_to"] == "c1"
+    assert concepts == [{"name": "共享单车"}]
+    normalized = normalize_decision({
+        "equivalent_candidate_number": 1,
+        "target_candidate_number": None,
+        "relation": "相似",
+        "reason": "同义词",
+    })
+    assert normalized["equivalent_candidate_number"] == 1
     with pytest.raises(ValueError, match="Unsupported relationship"):
-        normalize_decision({"equivalent_to": None, "relation": "近义", "reason": ""})
+        normalize_decision({"relation": "近义", "reason": ""})
+
+
+def test_candidate_numbers_map_to_internal_ids_without_exposing_ids_to_llm():
+    candidates = [
+        {"concept_id": "c1", "name": "风险一", "similarity": 0.9},
+        {"concept_id": "c2", "name": "风险二", "similarity": 0.8},
+    ]
+
+    equivalent = resolve_decision({
+        "equivalent_candidate_number": 2,
+        "target_candidate_number": 1,
+        "relation": "相似",
+        "reason": "同义",
+    }, candidates)
+    assert equivalent == {
+        "equivalent_to": "c2",
+        "target_concept_id": "c2",
+        "relation": "相似",
+        "reason": "同义",
+    }
+
+    hierarchy = resolve_decision({
+        "equivalent_candidate_number": None,
+        "target_candidate_number": 1,
+        "relation": "下位",
+        "reason": "具体风险",
+    }, candidates)
+    assert hierarchy["equivalent_to"] is None
+    assert hierarchy["target_concept_id"] == "c1"
+
+    unrelated = resolve_decision({
+        "equivalent_candidate_number": None,
+        "target_candidate_number": 2,
+        "relation": "无关",
+        "reason": "不同维度",
+    }, candidates)
+    assert unrelated["target_concept_id"] is None
+
+
+@pytest.mark.parametrize("value", [True, 1.5, "1", 0, -1])
+def test_candidate_numbers_reject_non_positive_strict_integers(value):
+    decision = {
+        "equivalent_candidate_number": value,
+        "target_candidate_number": None,
+        "relation": "相似",
+        "reason": "",
+    }
+    with pytest.raises(ValueError, match="positive integer"):
+        normalize_decision(decision)
+    with pytest.raises(ValueError):
+        DecisionOutput.model_validate(decision)
+
+
+def test_candidate_number_mapping_rejects_inconsistent_or_out_of_range_decisions():
+    candidates = [{"concept_id": "c1", "name": "风险一", "similarity": 0.9}]
+    with pytest.raises(ValueError, match="outside the available candidate range"):
+        resolve_decision({
+            "equivalent_candidate_number": None,
+            "target_candidate_number": 2,
+            "relation": "上位",
+            "reason": "",
+        }, candidates)
+    with pytest.raises(ValueError, match="requires target_candidate_number"):
+        resolve_decision({
+            "equivalent_candidate_number": None,
+            "target_candidate_number": None,
+            "relation": "相似",
+            "reason": "",
+        }, candidates)
+    with pytest.raises(ValueError, match="without candidates"):
+        resolve_decision({
+            "equivalent_candidate_number": 1,
+            "target_candidate_number": None,
+            "relation": "无关",
+            "reason": "",
+        }, [])
 
 
 def test_default_prompt_catalog_loads_and_renders_json_inputs():
     catalog = load_prompt_catalog(Path(__file__).parents[1] / "config" / "prompt_templates.json")
 
-    extraction = extraction_messages(catalog, [{"post_id": "p1", "text": "城市骑行"}])
-    decision = decision_messages(catalog, "城市骑行", [{"concept_id": "c1", "name": "骑行"}])
+    extraction = extraction_messages(
+        catalog,
+        [{"post_id": "p1", "author_id": "u1", "text": "城市骑行"}],
+    )
+    decision = decision_messages(
+        catalog,
+        "城市骑行",
+        [{"concept_id": "c1", "name": "骑行", "similarity": 0.9}],
+    )
 
-    assert catalog.templates["concept_extraction"].version == "2.0.0"
-    assert catalog.templates["relation_decision"].version == "2.1.0"
-    assert '"post_id": "p1"' in extraction[1][1]
+    assert catalog.templates["concept_extraction"].version == "2.1.0"
+    assert catalog.templates["relation_decision"].version == "3.0.0"
+    assert '"post_id"' not in extraction[1][1]
+    assert '"author_id"' not in extraction[1][1]
+    assert '"concept_id"' not in decision[1][1]
+    assert '"candidate_number": 1' in decision[1][1]
+    assert "source_post_ids" not in extraction[1][1]
+    assert "equivalent_to" not in decision[1][1]
+    assert "target_concept_id" not in decision[1][1]
     assert "舆情风险概念是当前帖子文本直接支持的" in extraction[0][1]
     assert "不得依据行业常识补充文本未表达的风险" in extraction[0][1]
     assert "纯正面成果、中性业务动作、一般产品功能" in extraction[1][1]
@@ -490,10 +590,9 @@ def test_default_prompt_catalog_loads_and_renders_json_inputs():
     assert "“交付延期”“充电设施故障”“老车主保值率受损”“事故错误归因”" in extraction[1][1]
     assert "“希望辅助驾驶覆盖更多城市”提取为“辅助驾驶覆盖不足”" in extraction[1][1]
     assert '"new_concept": "城市骑行"' in decision[1][1]
-    assert '"concept_id": "c1"' in decision[1][1]
     assert "完全等价优先，其次主动识别上下位" in decision[0][1]
     assert "必须遍历全部候选" in decision[1][1]
-    assert "只要存在上下位候选，就优先选择该候选" in decision[1][1]
+    assert "只要存在上下位候选，就优先将其序号填入 target_candidate_number" in decision[1][1]
     assert "一般化替换检查" in decision[1][1]
     assert "限定对象、功能、人群、阶段或场景" in decision[1][1]
     assert "‘配件库存信息不透明’是‘数据公开透明度不足’的具体场景，新概念判下位" in decision[1][1]
@@ -502,6 +601,14 @@ def test_default_prompt_catalog_loads_and_renders_json_inputs():
     assert "‘维护不足’与‘设备故障’是原因与后果" in decision[1][1]
     assert "‘质保权益不明确’与‘延长质保服务’是风险与治理措施" in decision[1][1]
     assert "不同风险维度之间不得建立上下位" in decision[1][1]
+
+    concept_schema = ConceptsOutput.model_json_schema()
+    decision_schema = DecisionOutput.model_json_schema()
+    serialized_schemas = json.dumps([concept_schema, decision_schema], ensure_ascii=False)
+    assert "source_post_ids" not in serialized_schemas
+    assert "concept_id" not in serialized_schemas
+    assert concept_schema["additionalProperties"] is False
+    assert decision_schema["additionalProperties"] is False
 
 
 @pytest.mark.parametrize(
@@ -540,12 +647,14 @@ def test_langgraph_runs_real_model_nodes_and_relationship_branches():
     store.upsert_concept(Concept("existing", "城市出行", [0.0, 1.0]), [], 10)
     chat = FakeChatModel(
         {"concepts": [
-            {"name": "公共交通", "source_post_ids": ["p1"]},
-            {"name": "公交接驳", "source_post_ids": ["p2"]},
+            {"name": "公共交通"},
+            {"name": "公交接驳"},
         ]},
         [
-            {"equivalent_to": None, "target_concept_id": "existing", "relation": "相似", "reason": "公共交通相关"},
-            {"equivalent_to": None, "target_concept_id": "existing", "relation": "下位", "reason": "公交接驳更具体"},
+            {"equivalent_candidate_number": None, "target_candidate_number": 1,
+             "relation": "相似", "reason": "公共交通相关"},
+            {"equivalent_candidate_number": None, "target_candidate_number": 1,
+             "relation": "下位", "reason": "公交接驳更具体"},
         ],
     )
     log = CaptureLogger()
@@ -588,8 +697,14 @@ def test_concurrent_per_post_extraction_merges_deterministically():
     assert chat.calls == 4
     assert chat.max_active_extractions == 2
     assert len(chat.extraction_messages) == 3
-    assert all(sum(f'"{post_id}"' in message for post_id in ("p1", "p2", "p3")) == 1
+    assert all(all(f'"{post_id}"' not in message for post_id in ("p1", "p2", "p3"))
                for message in chat.extraction_messages)
+    assert {
+        text
+        for message in chat.extraction_messages
+        for text in ("第一篇", "第二篇", "第三篇")
+        if text in message
+    } == {"第一篇", "第二篇", "第三篇"}
     assert state["concepts"] == [{
         "name": "EV 充电",
         "source_post_ids": ["p1", "p2", "p3"],
@@ -696,8 +811,9 @@ def test_equivalent_decision_merges_into_canonical_candidate():
     canonical = Concept("canonical", "共享单车", [1.0, 0.0])
     store.upsert_concept(canonical, [], 10)
     chat = FakeChatModel(
-        {"concepts": [{"name": "共享自行车", "source_post_ids": ["p1"]}]},
-        [{"equivalent_to": "canonical", "target_concept_id": "canonical", "relation": "相似", "reason": "同义"}],
+        {"concepts": [{"name": "共享自行车"}]},
+        [{"equivalent_candidate_number": 1, "target_candidate_number": None,
+          "relation": "相似", "reason": "同义"}],
     )
     catalog = load_prompt_catalog(config.prompt_template_path)
     graph = build_experiment_graph(config, chat, FakeEmbeddings(), store, CaptureLogger(), catalog)
@@ -719,8 +835,10 @@ def test_target_labels_deduplicate_canonical_concepts_and_merge_sources():
             {"name": "公共自行车", "source_post_ids": ["wrong"]},
         ]},
         [
-            {"equivalent_to": "canonical", "target_concept_id": "canonical", "relation": "相似", "reason": "同义"},
-            {"equivalent_to": "canonical", "target_concept_id": "canonical", "relation": "相似", "reason": "同义"},
+            {"equivalent_candidate_number": 1, "target_candidate_number": None,
+             "relation": "相似", "reason": "同义"},
+            {"equivalent_candidate_number": 1, "target_candidate_number": None,
+             "relation": "相似", "reason": "同义"},
         ],
     )
     graph = build_experiment_graph(
@@ -744,8 +862,9 @@ def test_missing_provider_usage_is_explicitly_marked_unavailable():
     config = settings()
     store = MemoryGraphStore()
     chat = FakeChatModel(
-        {"concepts": [{"name": "骑行", "source_post_ids": ["p1"]}]},
-        [{"equivalent_to": None, "target_concept_id": None, "relation": "无关", "reason": "无候选"}],
+        {"concepts": [{"name": "骑行"}]},
+        [{"equivalent_candidate_number": None, "target_candidate_number": None,
+          "relation": "无关", "reason": "无候选"}],
         include_usage=False,
     )
     catalog = load_prompt_catalog(config.prompt_template_path)
@@ -957,8 +1076,9 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     config = settings(data_dir=data_dir, result_dir=tmp_path / "results")
     store = MemoryGraphStore()
     chat = FakeChatModel(
-        {"concepts": [{"name": "城市骑行", "source_post_ids": ["p1"]}]},
-        [{"equivalent_to": None, "target_concept_id": None, "relation": "无关", "reason": "无候选"}],
+        {"concepts": [{"name": "城市骑行"}]},
+        [{"equivalent_candidate_number": None, "target_candidate_number": None,
+          "relation": "无关", "reason": "无候选"}],
     )
 
     run_dir = run_experiment(config, chat_model=chat, embedding_model=FakeEmbeddings(), graph_store=store)
@@ -974,8 +1094,8 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     assert "secret-embedding-key" not in saved_config
     assert "secret-password" not in saved_config
     saved_prompts = json.loads((run_dir / "prompts.json").read_text(encoding="utf-8"))
-    assert saved_prompts["templates"]["concept_extraction"]["version"] == "2.0.0"
-    assert saved_prompts["templates"]["relation_decision"]["version"] == "2.1.0"
+    assert saved_prompts["templates"]["concept_extraction"]["version"] == "2.1.0"
+    assert saved_prompts["templates"]["relation_decision"]["version"] == "3.0.0"
     assert "secret-key" not in json.dumps(saved_prompts)
     trial_dir = next((run_dir / "trials").iterdir())
     result = json.loads((trial_dir / "result.json").read_text(encoding="utf-8"))
@@ -1002,8 +1122,8 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     assert result["graph"]["posts"][0]["text"] == "城市骑行"
     assert result["prompt_templates"]["snapshot_file"] == "prompts.json"
     assert result["prompt_templates"]["versions"] == {
-        "concept_extraction": "2.0.0",
-        "relation_decision": "2.1.0",
+        "concept_extraction": "2.1.0",
+        "relation_decision": "3.0.0",
     }
     config_snapshot = json.loads(saved_config)
     assert config_snapshot["module"] == "hisg"
@@ -1051,8 +1171,9 @@ def test_custom_prompt_path_is_used_by_both_model_nodes_and_snapshotted(tmp_path
         prompt_template_path=prompt_path,
     )
     chat = FakeChatModel(
-        {"concepts": [{"name": "骑行", "source_post_ids": ["p1"]}]},
-        [{"equivalent_to": None, "target_concept_id": None, "relation": "无关", "reason": "无候选"}],
+        {"concepts": [{"name": "骑行"}]},
+        [{"equivalent_candidate_number": None, "target_candidate_number": None,
+          "relation": "无关", "reason": "无候选"}],
     )
 
     run_dir = run_experiment(
@@ -1118,8 +1239,9 @@ def test_multiple_seed_trials_reset_graph_and_report_stability(tmp_path):
     def chat_factory(seed):
         created_seeds.append(seed)
         return FakeChatModel(
-            {"concepts": [{"name": "骑行", "source_post_ids": ["p1"]}]},
-            [{"equivalent_to": None, "target_concept_id": None, "relation": "无关", "reason": "无候选"}],
+            {"concepts": [{"name": "骑行"}]},
+            [{"equivalent_candidate_number": None, "target_candidate_number": None,
+              "relation": "无关", "reason": "无候选"}],
         )
 
     run_dir = run_experiment(
@@ -1161,8 +1283,9 @@ def test_failed_trial_stops_remaining_seeds_and_clears_graph(tmp_path):
         if seed == 2:
             return FakeChatModel({"unexpected": []}, [])
         return FakeChatModel(
-            {"concepts": [{"name": "骑行", "source_post_ids": ["p1"]}]},
-            [{"equivalent_to": None, "target_concept_id": None, "relation": "无关", "reason": "无候选"}],
+            {"concepts": [{"name": "骑行"}]},
+            [{"equivalent_candidate_number": None, "target_candidate_number": None,
+              "relation": "无关", "reason": "无候选"}],
         )
 
     with pytest.raises(ValueError, match="concepts"):

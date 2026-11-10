@@ -6,22 +6,35 @@ from pathlib import Path
 from string import Formatter
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ConceptMention(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     name: str = Field(description="简洁规范、由文本直接支持的中文舆情风险概念")
-    source_post_ids: list[str] = Field(description="直接支持该风险概念的来源 post_id")
 
 
 class ConceptsOutput(BaseModel):
-    concepts: list[ConceptMention] = Field(description="去重后的原子舆情风险概念及来源帖子")
+    model_config = ConfigDict(extra="forbid")
+
+    concepts: list[ConceptMention] = Field(description="去重后的原子舆情风险概念")
 
 
 class DecisionOutput(BaseModel):
-    equivalent_to: str | None = Field(description="风险含义完全等价时填写候选 concept_id，否则为 null")
-    target_concept_id: str | None = Field(
-        description="唯一的关系目标候选 concept_id；优先选择可形成上下位的候选，无候选时为 null"
+    model_config = ConfigDict(extra="forbid")
+
+    equivalent_candidate_number: int | None = Field(
+        default=None,
+        ge=1,
+        strict=True,
+        description="风险含义完全等价时填写从 1 开始的候选序号，否则为 null",
+    )
+    target_candidate_number: int | None = Field(
+        default=None,
+        ge=1,
+        strict=True,
+        description="非等价关系的目标候选序号；无目标时为 null",
     )
     relation: str = Field(description="仅可为上位、下位、相似、无关；不等价时优先识别上下位")
     reason: str = Field(description="简短判断依据")
@@ -174,12 +187,28 @@ def _render_template(template_name: str, template: PromptTemplate, values: dict[
 
 
 def extraction_messages(catalog: PromptCatalog, posts: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    payload = json.dumps(posts, ensure_ascii=False, indent=2)
+    semantic_posts = [
+        {key: post[key] for key in ("created_at", "hotness", "text") if key in post}
+        for post in posts
+    ]
+    payload = json.dumps(semantic_posts, ensure_ascii=False, indent=2)
     return _render_template("concept_extraction", catalog.templates["concept_extraction"], {"posts_json": payload})
 
 
 def decision_messages(catalog: PromptCatalog, concept: str, candidates: list[dict[str, Any]]) -> list[tuple[str, str]]:
-    payload = json.dumps({"new_concept": concept, "candidates": candidates}, ensure_ascii=False, indent=2)
+    semantic_candidates = [
+        {
+            "candidate_number": index,
+            "name": candidate["name"],
+            "similarity": candidate["similarity"],
+        }
+        for index, candidate in enumerate(candidates, start=1)
+    ]
+    payload = json.dumps(
+        {"new_concept": concept, "candidates": semantic_candidates},
+        ensure_ascii=False,
+        indent=2,
+    )
     return _render_template("relation_decision", catalog.templates["relation_decision"], {"input_json": payload})
 
 
@@ -200,21 +229,19 @@ def normalize_concepts(value: Any) -> list[dict[str, Any]]:
         return normalize_concepts(content)
     if not isinstance(items, list):
         raise ValueError("LLM response field 'concepts' must be a list")
-    normalized: dict[str, set[str]] = {}
+    normalized: dict[str, str] = {}
     for item in items:
         if isinstance(item, str):
-            name, sources = item.strip(), []
+            name = item.strip()
         elif isinstance(item, ConceptMention):
-            name, sources = item.name.strip(), item.source_post_ids
+            name = item.name.strip()
         elif isinstance(item, dict):
-            name, sources = str(item.get("name", "")).strip(), item.get("source_post_ids", [])
+            name = str(item.get("name", "")).strip()
         else:
-            raise ValueError("Each risk concept must be a string or an object with name and source_post_ids")
-        if not isinstance(sources, list) or any(not isinstance(source, str) for source in sources):
-            raise ValueError("source_post_ids must be a list of strings")
+            raise ValueError("Each risk concept must be a string or an object with a name")
         if name:
-            normalized.setdefault(name, set()).update(sources)
-    return [{"name": name, "source_post_ids": sorted(sources)} for name, sources in normalized.items()]
+            normalized.setdefault(name, name)
+    return [{"name": name} for name in normalized.values()]
 
 
 def normalize_decision(value: Any) -> dict[str, Any]:
@@ -234,12 +261,70 @@ def normalize_decision(value: Any) -> dict[str, Any]:
     relation = result.get("relation")
     if relation not in {"上位", "下位", "相似", "无关"}:
         raise ValueError(f"Unsupported relationship: {relation!r}")
-    equivalent_to = result.get("equivalent_to")
-    if equivalent_to is not None and not isinstance(equivalent_to, str):
-        raise ValueError("equivalent_to must be a candidate ID or null")
+    equivalent_number = _normalize_candidate_number(
+        result.get("equivalent_candidate_number"), "equivalent_candidate_number"
+    )
+    target_number = _normalize_candidate_number(
+        result.get("target_candidate_number"), "target_candidate_number"
+    )
     return {
-        "equivalent_to": equivalent_to,
-        "target_concept_id": result.get("target_concept_id"),
+        "equivalent_candidate_number": equivalent_number,
+        "target_candidate_number": target_number,
         "relation": relation,
         "reason": str(result.get("reason", "")),
+    }
+
+
+def _normalize_candidate_number(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+        raise ValueError(f"{field_name} must be a positive integer or null")
+    return value
+
+
+def resolve_decision(value: Any, candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    semantic = normalize_decision(value)
+    equivalent_number = semantic["equivalent_candidate_number"]
+    target_number = semantic["target_candidate_number"]
+    relation = semantic["relation"]
+
+    if not candidates:
+        if equivalent_number is not None or target_number is not None or relation != "无关":
+            raise ValueError("A decision without candidates must use null candidate numbers and relation '无关'")
+        return {
+            "equivalent_to": None,
+            "target_concept_id": None,
+            "relation": relation,
+            "reason": semantic["reason"],
+        }
+
+    def candidate_id(number: int, field_name: str) -> str:
+        if number > len(candidates):
+            raise ValueError(
+                f"{field_name} {number} is outside the available candidate range 1..{len(candidates)}"
+            )
+        return str(candidates[number - 1]["concept_id"])
+
+    if equivalent_number is not None:
+        equivalent_id = candidate_id(equivalent_number, "equivalent_candidate_number")
+        return {
+            "equivalent_to": equivalent_id,
+            "target_concept_id": equivalent_id,
+            "relation": relation,
+            "reason": semantic["reason"],
+        }
+
+    if relation in {"上位", "下位", "相似"}:
+        if target_number is None:
+            raise ValueError(f"Relation {relation!r} requires target_candidate_number")
+        target_id = candidate_id(target_number, "target_candidate_number")
+    else:
+        target_id = None
+
+    return {
+        "equivalent_to": None,
+        "target_concept_id": target_id,
+        "relation": relation,
+        "reason": semantic["reason"],
     }
