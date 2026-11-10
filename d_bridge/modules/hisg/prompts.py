@@ -10,18 +10,20 @@ from pydantic import BaseModel, Field
 
 
 class ConceptMention(BaseModel):
-    name: str = Field(description="简洁规范的中文名词短语")
-    source_post_ids: list[str] = Field(description="直接表达该概念的来源 post_id")
+    name: str = Field(description="简洁规范、由文本直接支持的中文舆情风险概念")
+    source_post_ids: list[str] = Field(description="直接支持该风险概念的来源 post_id")
 
 
 class ConceptsOutput(BaseModel):
-    concepts: list[ConceptMention] = Field(description="去重后的原子语义概念及来源帖子")
+    concepts: list[ConceptMention] = Field(description="去重后的原子舆情风险概念及来源帖子")
 
 
 class DecisionOutput(BaseModel):
-    equivalent_to: str | None = Field(description="完全等价时填写候选 concept_id，否则为 null")
-    target_concept_id: str | None = Field(description="关系指向的候选 concept_id；无候选时为 null")
-    relation: str = Field(description="仅可为上位、下位、相似、无关")
+    equivalent_to: str | None = Field(description="风险含义完全等价时填写候选 concept_id，否则为 null")
+    target_concept_id: str | None = Field(
+        description="唯一的关系目标候选 concept_id；优先选择可形成上下位的候选，无候选时为 null"
+    )
+    relation: str = Field(description="仅可为上位、下位、相似、无关；不等价时优先识别上下位")
     reason: str = Field(description="简短判断依据")
 
 
@@ -189,12 +191,12 @@ def normalize_concepts(value: Any) -> list[dict[str, Any]]:
     elif isinstance(value, str):
         parsed = json.loads(value)
         if not isinstance(parsed, dict):
-            raise ValueError("Concept extraction response must be a JSON object")
+            raise ValueError("Risk concept extraction response must be a JSON object")
         items = parsed.get("concepts")
     else:
         content = getattr(value, "content", None)
         if content is None:
-            raise ValueError("Concept extraction response has an unsupported shape")
+            raise ValueError("Risk concept extraction response has an unsupported shape")
         return normalize_concepts(content)
     if not isinstance(items, list):
         raise ValueError("LLM response field 'concepts' must be a list")
@@ -207,7 +209,7 @@ def normalize_concepts(value: Any) -> list[dict[str, Any]]:
         elif isinstance(item, dict):
             name, sources = str(item.get("name", "")).strip(), item.get("source_post_ids", [])
         else:
-            raise ValueError("Each concept must be a string or an object with name and source_post_ids")
+            raise ValueError("Each risk concept must be a string or an object with name and source_post_ids")
         if not isinstance(sources, list) or any(not isinstance(source, str) for source in sources):
             raise ValueError("source_post_ids must be a list of strings")
         if name:
@@ -225,10 +227,10 @@ def normalize_decision(value: Any) -> dict[str, Any]:
     else:
         content = getattr(value, "content", None)
         if content is None:
-            raise ValueError("Relationship response has an unsupported shape")
+            raise ValueError("Risk relationship response has an unsupported shape")
         return normalize_decision(content)
     if not isinstance(result, dict):
-        raise ValueError("Relationship response must be a JSON object")
+        raise ValueError("Risk relationship response must be a JSON object")
     relation = result.get("relation")
     if relation not in {"上位", "下位", "相似", "无关"}:
         raise ValueError(f"Unsupported relationship: {relation!r}")

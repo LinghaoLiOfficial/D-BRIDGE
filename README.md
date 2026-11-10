@@ -1,6 +1,6 @@
 # D-BRIDGE 实验框架：HISG Builder
 
-当前仓库实现 D-BRIDGE 的首个实验模块 **HISG Builder**（Hierarchical Incremental Semantic Graph Builder）。HISG 按 `docs/202611061622` 的设计实现层次化、增量式语义标签网络构建：时间与热度联合分层抽样、LLM 原子概念提取、Embedding 相似节点检索、LLM 等价/层级关系判定，以及 Neo4j 图谱增量写入。正式实验会真实调用 `.env` 中配置的聊天模型和 Embedding 服务。
+当前仓库实现 D-BRIDGE 的首个实验模块 **HISG Builder**（Hierarchical Incremental Semantic Graph Builder）。HISG 按 `docs/202611061622` 的设计构建层次化、增量式舆情风险标签网络：时间与热度联合分层抽样、LLM 原子舆情风险概念提取、Embedding 相似节点检索、LLM 等价/风险类别层级关系判定，以及 Neo4j 图谱增量写入。正式实验会真实调用 `.env` 中配置的聊天模型和 Embedding 服务。
 
 ## 环境准备
 
@@ -46,7 +46,7 @@ DATA_DIR=data ENV_FILE=.env make run
 - `summary.json`：各轮状态、耗时、token、抽样覆盖率汇总和跨轮稳定性指标。
 - `trials/trial-<序号>-seed-<种子>/`：每轮独立的 `config.json`、`experiment.log`、`sampling.json`、`result.json` 和 `graph.json`；失败轮保存 `error.json`。
 
-`sampling.json` 记录总体数量、实际样本量、总体覆盖率、有效分箱数，以及每个联合层的原始数量、抽样数量、层内覆盖率、取值范围和样本 ID。`result.json` 同时包含该抽样摘要；其中的 `llm_usage` 保存每次调用的 input/output/total tokens、模型、响应 ID、后端 fingerprint 和耗时。兼容服务不返回 usage 时会明确标记不可用，不进行本地估算。运行时先显示逐帖概念提取进度，再显示合并后概念的处理进度。运行需要外部 API 和正在运行、凭据匹配的 Neo4j 服务。
+`sampling.json` 记录总体数量、实际样本量、总体覆盖率、有效分箱数，以及每个联合层的原始数量、抽样数量、层内覆盖率、取值范围和样本 ID。`result.json` 同时包含该抽样摘要；其中的 `llm_usage` 保存每次调用的 input/output/total tokens、模型、响应 ID、后端 fingerprint 和耗时。兼容服务不返回 usage 时会明确标记不可用，不进行本地估算。运行时先显示逐帖风险概念提取进度，再显示合并后风险概念的处理进度。运行需要外部 API 和正在运行、凭据匹配的 Neo4j 服务。
 
 ## 数据格式
 
@@ -67,19 +67,19 @@ ID 必须非空且全局唯一，时间必须为 ISO-8601，热度需为数值�
 
 所有超参数可在 `.env` 覆盖，默认值见 `.env.example`：`SAMPLE_SIZE`、`TIME_BINS`、`HOTNESS_BINS`、`SIMILARITY_TOP_K`、`SIMILARITY_THRESHOLD`、`TARGET_GRANULARITIES`、`NEO4J_BATCH_SIZE`。模型通过 `API_KEY`、`BASE_URL`、`MODEL`、`TEMPERATURE`、`TIMEOUT`、`MAX_RETRIES` 配置；默认温度为 `0`。`ENABLE_THINKING` 只接受 `true` 或 `false`，默认 `false`；模型名包含 `qwen` 时会作为兼容扩展字段发送，其他模型不会收到该字段。向量服务通过 `EMBEDDING_*` 配置；Neo4j 通过 `NEO4J_*` 配置。
 
-全部概念处理完成后，系统按 `下位概念-[:IS_A]->上位概念` 计算当前图谱内的相对颗粒度：没有已识别上位节点的概念为 `0`，其余节点取所有直接上位节点颗粒度的最大值加一。`TARGET_GRANULARITIES` 是非空的非负整数 JSON 数组，默认 `[0]`；`result.json` 的 `target_labels` 只包含指定层级，完整标签仍保留在 `labels`。若上下位图存在环，环内边保留在 Neo4j 中但不参与颗粒度计算，并记录在 `granularity.ignored_cycle_edges`。
+全部风险概念处理完成后，系统按 `下位风险概念-[:IS_A]->上位风险概念` 计算当前图谱内的相对颗粒度：没有已识别上位节点的风险概念为 `0`，其余节点取所有直接上位节点颗粒度的最大值加一。`TARGET_GRANULARITIES` 是非空的非负整数 JSON 数组，默认 `[0]`；`result.json` 的 `target_labels` 只包含指定层级的风险标签，完整风险标签仍保留在 `labels`。若上下位图存在环，环内边保留在 Neo4j 中但不参与颗粒度计算，并记录在 `granularity.ignored_cycle_edges`。
 
-概念提取按帖子分别调用模型，`CONCEPT_EXTRACTION_CONCURRENCY` 控制最大并发数，默认 `3`。每篇帖子内先规范化概念，跨帖子再按移除空白并忽略大小写后的名称确定性合并，同时合并来源帖子 ID；不会额外调用 LLM 或 Embedding 做语义近义合并。
+风险概念提取按帖子分别调用模型，`CONCEPT_EXTRACTION_CONCURRENCY` 控制最大并发数，默认 `3`。舆情风险概念必须由当前帖子文本直接支持，覆盖问题、隐患、负面后果、权益争议、传播风险和治理缺口；纯正面成果、中性业务动作、一般产品功能及解决措施本身不作为风险概念。每篇帖子内先规范化风险概念，跨帖子再按移除空白并忽略大小写后的名称确定性合并，同时合并来源帖子 ID；不会额外调用 LLM 或 Embedding 做语义近义合并。
 
-合并后的概念按 `CONCEPT_PROCESSING_CONCURRENCY` 分批处理，控制等价/关系判定 LLM 的最大并发数，默认 `3`。每批概念基于该批开始时的图谱检索候选，并在判定完成后按原顺序写入图谱；下一批会看到前一批的更新。设置为 `1` 时概念处理保持逐个顺序执行。
+合并后的风险概念按 `CONCEPT_PROCESSING_CONCURRENCY` 分批处理，控制等价/关系判定 LLM 的最大并发数，默认 `3`。关系判定按“完全等价、上下位、相似或无关”的顺序执行，并将上下位识别作为构建风险标签层级的重点：同一风险领域中，限定对象、功能、人群、阶段或场景的具体风险可以归入更宽泛、可复用的风险类别。每个新概念仍只选择一个关系目标；存在合理层级候选时优先选择该候选，而不是仅按最高语义相似度选择目标。仅有共同领域或词语重叠，以及因果、风险与治理措施、流程先后、物理组成和不同风险维度，不会写为 `IS_A`。每批概念基于该批开始时的图谱检索候选，并在判定完成后按原顺序写入图谱；下一批会看到前一批的更新。设置为 `1` 时概念处理保持逐个顺序执行。
 
 `EXPERIMENT_SEEDS` 使用 JSON 整数数组，数组长度就是 trial 数量：默认 `[42]` 只运行一次，设置为 `[42,43,44]` 会运行三次，也允许使用重复种子。每轮会设置 Python `random` 和 NumPy 的全局随机状态；Pandas 随机操作依赖 NumPy，全新随机代码仍应显式传入 `random_state`。这些 seed 不会传给 LLM，只控制本地 Python 随机性，包括分箱并列值、配额平局和层内样本；相同 seed 可复现同一批样本，不同 seed 用于观察抽样与后续输出的变化。
 
 每轮开始前清空 D-BRIDGE 图谱，完成后先导出该轮快照。多轮成功时 Neo4j 最终保留最后一轮图谱；任一轮失败会立即停止后续轮次，写出失败摘要并清理失败轮的残留数据。`summary.json` 对概念、标签和关系集合计算两两 Jaccard 与完全一致率；只有一轮时稳定性状态为 `insufficient_samples`。
 
-提示词模板默认从 `config/prompt_templates.json` 加载，也可通过 `PROMPT_TEMPLATE_PATH` 指向其他 JSON 文件，以便在不同模板版本之间切换。概念提取与关系判定模板各自维护 `version`；修改任一模板正文时应同步升级对应版本。模板中的 `allowed_variables` 必须与正文占位符一致，程序会在调用模型前校验必需变量、未知变量和消息结构。每次运行会复制实际模板到结果目录，并在 `config.json` 和 `result.json` 中记录版本，因此后续修改源模板不会影响历史实验的追溯。
+提示词模板默认从 `config/prompt_templates.json` 加载，也可通过 `PROMPT_TEMPLATE_PATH` 指向其他 JSON 文件，以便在不同模板版本之间切换。风险概念提取与关系判定模板各自维护 `version`；修改任一模板正文时应同步升级对应版本。当前风险语义口径自 `2.0.0` 起生效，旧主题概念实验不应与新实验直接比较标签稳定性。模板中的 `allowed_variables` 必须与正文占位符一致，程序会在调用模型前校验必需变量、未知变量和消息结构。每次运行会复制实际模板到结果目录，并在 `config.json` 和 `result.json` 中记录版本，因此后续修改源模板不会影响历史实验的追溯。
 
-LangGraph 包含 `extract_atomic_concepts` 与 `classify_equivalence_and_relation` 两个真实聊天模型调用节点；概念处理按配置并发判定，并按批次顺序增量更新图谱。支持的关系为“上位”“下位”“相似”“无关”；Neo4j 中用 `IS_A` 表示上下位，用 `RELATED_TO` 表示相似，帖子来源用 `MENTIONS` 表示，等价概念合并后转移到规范节点。
+LangGraph 包含 `extract_atomic_concepts` 与 `classify_equivalence_and_relation` 两个真实聊天模型调用节点；结构字段继续使用 `concepts`、`concept_id`、`labels` 和 Neo4j `Concept`，其业务含义统一为舆情风险概念。风险概念按配置并发判定，并按批次顺序增量更新图谱。支持的关系为“上位”“下位”“相似”“无关”；Neo4j 中用 `IS_A` 表示严格风险类别上下位，用 `RELATED_TO` 表示风险语义相关，帖子来源用 `MENTIONS` 表示，等价风险概念合并后转移到规范节点。HISG 负责构建候选风险标签体系，帖子到多风险标签的最终分类由后续模块完成。
 
 ## 测试与排查
 

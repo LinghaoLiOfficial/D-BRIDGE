@@ -480,13 +480,28 @@ def test_default_prompt_catalog_loads_and_renders_json_inputs():
     extraction = extraction_messages(catalog, [{"post_id": "p1", "text": "城市骑行"}])
     decision = decision_messages(catalog, "城市骑行", [{"concept_id": "c1", "name": "骑行"}])
 
-    assert catalog.templates["concept_extraction"].version == "1.2.0"
+    assert catalog.templates["concept_extraction"].version == "2.0.0"
+    assert catalog.templates["relation_decision"].version == "2.1.0"
     assert '"post_id": "p1"' in extraction[1][1]
-    assert "企业名称、品牌名称、人名及其他专有实体名称都不是主题关键词" in extraction[0][1]
-    assert "排除“某企业”“某品牌”“张三”" in extraction[1][1]
-    assert "保留“售后服务”“续航下降”“充电故障”“价格补偿”" in extraction[1][1]
+    assert "舆情风险概念是当前帖子文本直接支持的" in extraction[0][1]
+    assert "不得依据行业常识补充文本未表达的风险" in extraction[0][1]
+    assert "纯正面成果、中性业务动作、一般产品功能" in extraction[1][1]
+    assert "“交付量增长”“超充站建设”“座椅通风功能”“电池质保政策”不得单独输出" in extraction[1][1]
+    assert "“交付延期”“充电设施故障”“老车主保值率受损”“事故错误归因”" in extraction[1][1]
+    assert "“希望辅助驾驶覆盖更多城市”提取为“辅助驾驶覆盖不足”" in extraction[1][1]
     assert '"new_concept": "城市骑行"' in decision[1][1]
     assert '"concept_id": "c1"' in decision[1][1]
+    assert "完全等价优先，其次主动识别上下位" in decision[0][1]
+    assert "必须遍历全部候选" in decision[1][1]
+    assert "只要存在上下位候选，就优先选择该候选" in decision[1][1]
+    assert "一般化替换检查" in decision[1][1]
+    assert "限定对象、功能、人群、阶段或场景" in decision[1][1]
+    assert "‘配件库存信息不透明’是‘数据公开透明度不足’的具体场景，新概念判下位" in decision[1][1]
+    assert "‘语音交互识别稳定性不足’是‘车机系统稳定性不足’的具体功能风险，新概念判下位" in decision[1][1]
+    assert "‘老款车型付费升级价格争议’是‘车企价格调整引发权益争议’的具体人群与场景风险，新概念判下位" in decision[1][1]
+    assert "‘维护不足’与‘设备故障’是原因与后果" in decision[1][1]
+    assert "‘质保权益不明确’与‘延长质保服务’是风险与治理措施" in decision[1][1]
+    assert "不同风险维度之间不得建立上下位" in decision[1][1]
 
 
 @pytest.mark.parametrize(
@@ -579,7 +594,7 @@ def test_concurrent_per_post_extraction_merges_deterministically():
         "name": "EV 充电",
         "source_post_ids": ["p1", "p2", "p3"],
     }]
-    extraction_usage = [item for item in state["llm_usage"] if item["task"] == "原子语义概念提取"]
+    extraction_usage = [item for item in state["llm_usage"] if item["task"] == "原子舆情风险概念提取"]
     assert [item["post_index"] for item in extraction_usage] == [0, 1, 2]
     assert [item["post_id"] for item in extraction_usage] == ["p1", "p2", "p3"]
 
@@ -604,7 +619,7 @@ def test_concept_processing_runs_bounded_parallel_decisions_and_updates_in_order
     assert store.candidate_snapshots == [[], [], expected_ids[:2], expected_ids[:2]]
     assert [item["concept"] for item in state["decisions"]] == [f"概念{i}" for i in range(1, 5)]
     assert [item["concept_index"] for item in state["llm_usage"]
-            if item["task"] == "等价判定与层级关系识别"] == [0, 1, 2, 3]
+            if item["task"] == "风险等价与类别层级关系识别"] == [0, 1, 2, 3]
 
 
 def test_concept_processing_concurrency_one_is_sequential():
@@ -646,7 +661,7 @@ def test_failed_concept_batch_preserves_completed_usage_and_does_not_update_grap
     assert chat.decision_names == ["概念1", "概念2"]
     assert store.nodes == {}
     assert [item["concept"] for item in usage
-            if item["task"] == "等价判定与层级关系识别"] == ["概念1"]
+            if item["task"] == "风险等价与类别层级关系识别"] == ["概念1"]
 
 
 def test_failed_per_post_extraction_preserves_completed_usage():
@@ -959,7 +974,8 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     assert "secret-embedding-key" not in saved_config
     assert "secret-password" not in saved_config
     saved_prompts = json.loads((run_dir / "prompts.json").read_text(encoding="utf-8"))
-    assert saved_prompts["templates"]["concept_extraction"]["version"] == "1.2.0"
+    assert saved_prompts["templates"]["concept_extraction"]["version"] == "2.0.0"
+    assert saved_prompts["templates"]["relation_decision"]["version"] == "2.1.0"
     assert "secret-key" not in json.dumps(saved_prompts)
     trial_dir = next((run_dir / "trials").iterdir())
     result = json.loads((trial_dir / "result.json").read_text(encoding="utf-8"))
@@ -986,8 +1002,8 @@ def test_full_run_writes_artifacts_without_credentials(tmp_path):
     assert result["graph"]["posts"][0]["text"] == "城市骑行"
     assert result["prompt_templates"]["snapshot_file"] == "prompts.json"
     assert result["prompt_templates"]["versions"] == {
-        "concept_extraction": "1.2.0",
-        "relation_decision": "1.0.0",
+        "concept_extraction": "2.0.0",
+        "relation_decision": "2.1.0",
     }
     config_snapshot = json.loads(saved_config)
     assert config_snapshot["module"] == "hisg"

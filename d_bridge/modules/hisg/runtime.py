@@ -288,7 +288,7 @@ def run_experiment(
                     },
                 })
                 logger.bind(trial_index=trial_index, seed=seed).info(
-                    "Trial completed: concepts={}, labels={}, target_labels={}",
+                    "Trial completed: risk_concepts={}, labels={}, target_labels={}",
                     len(output["concepts"]), len(output["labels"]), len(output["target_labels"])
                 )
             except Exception as exc:

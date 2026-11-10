@@ -165,7 +165,7 @@ def build_experiment_graph(
     def extract_node(state: ExperimentState) -> dict[str, Any]:
         posts = state["sampled_posts"]
         started = time.perf_counter()
-        extraction_progress = tqdm(total=len(posts), desc="帖子概念提取", unit="帖子")
+        extraction_progress = tqdm(total=len(posts), desc="帖子风险概念提取", unit="帖子")
         results: list[tuple[int, str, list[dict[str, Any]], dict[str, Any]]] = []
 
         def extract_post(post_index: int, post: dict[str, Any]):
@@ -173,7 +173,7 @@ def build_experiment_graph(
             messages = extraction_messages(prompt_catalog, [post])
             post_started = time.perf_counter()
             bound = logger.bind(
-                task="原子语义概念提取",
+                task="原子舆情风险概念提取",
                 trial_index=trial_index,
                 seed=seed,
                 post_id=post_id,
@@ -186,7 +186,7 @@ def build_experiment_graph(
                 for concept in concepts:
                     concept["source_post_ids"] = [post_id]
                 usage.update({
-                    "task": "原子语义概念提取",
+                    "task": "原子舆情风险概念提取",
                     "trial_index": trial_index,
                     "seed": seed,
                     "post_id": post_id,
@@ -194,7 +194,7 @@ def build_experiment_graph(
                     "duration_seconds": round(time.perf_counter() - post_started, 6),
                 })
                 logger.bind(
-                    task="原子语义概念提取",
+                    task="原子舆情风险概念提取",
                     trial_index=trial_index,
                     seed=seed,
                     post_id=post_id,
@@ -235,8 +235,8 @@ def build_experiment_graph(
                     completed_indexes.add(result[0])
             results.sort(key=lambda item: item[0])
             collected_usage.extend(item[3] for item in results)
-            logger.bind(task="原子语义概念提取", trial_index=trial_index, seed=seed).exception(
-                "逐帖概念提取失败，耗时秒={:.3f}", time.perf_counter() - started
+            logger.bind(task="原子舆情风险概念提取", trial_index=trial_index, seed=seed).exception(
+                "逐帖风险概念提取失败，耗时秒={:.3f}", time.perf_counter() - started
             )
             raise
         finally:
@@ -249,9 +249,9 @@ def build_experiment_graph(
             (post_index, post_id, post_concepts)
             for post_index, post_id, post_concepts, _ in results
         ])
-        progress["bar"] = tqdm(total=len(concepts), desc="概念处理", unit="概念")
-        logger.bind(task="原子语义概念提取", trial_index=trial_index, seed=seed).info(
-            "逐帖提取完成，帖子数={} 合并后概念数={} 总耗时秒={:.3f}",
+        progress["bar"] = tqdm(total=len(concepts), desc="风险概念处理", unit="风险概念")
+        logger.bind(task="原子舆情风险概念提取", trial_index=trial_index, seed=seed).info(
+            "逐帖风险概念提取完成，帖子数={} 合并后风险概念数={} 总耗时秒={:.3f}",
             len(posts),
             len(concepts),
             time.perf_counter() - started,
@@ -279,7 +279,7 @@ def build_experiment_graph(
                     item for item in candidates
                     if float(item["similarity"]) >= settings.similarity_threshold
                 ]
-                logger.bind(task="语义相似节点检索").info(
+                logger.bind(task="风险语义相似节点检索").info(
                     "业务输入={} 业务输出={} 耗时秒={:.3f}",
                     json.dumps({"concept": concept["name"], "top_k": settings.similarity_top_k,
                                 "threshold": settings.similarity_threshold}, ensure_ascii=False),
@@ -293,7 +293,7 @@ def build_experiment_graph(
                     "candidates": candidates,
                 })
             except Exception:
-                logger.bind(task="语义相似节点检索").exception(
+                logger.bind(task="风险语义相似节点检索").exception(
                     "业务步骤失败，耗时秒={:.3f}", time.perf_counter() - started
                 )
                 raise
@@ -304,7 +304,7 @@ def build_experiment_graph(
             messages = decision_messages(prompt_catalog, concept["name"], candidates)
             started = time.perf_counter()
             bound = logger.bind(
-                task="等价判定与层级关系识别",
+                task="风险等价与类别层级关系识别",
                 trial_index=trial_index,
                 seed=seed,
                 concept=concept["name"],
@@ -314,7 +314,7 @@ def build_experiment_graph(
             try:
                 response, usage = _invoke_structured(chat_model, DecisionOutput, messages)
                 usage.update({
-                    "task": "等价判定与层级关系识别",
+                    "task": "风险等价与类别层级关系识别",
                     "trial_index": trial_index,
                     "seed": seed,
                     "concept": concept["name"],
@@ -326,14 +326,14 @@ def build_experiment_graph(
                 equivalent = decision["equivalent_to"]
                 target = decision["target_concept_id"]
                 if equivalent is not None and equivalent not in candidate_ids:
-                    raise ValueError(f"LLM returned unknown equivalent candidate: {equivalent}")
+                    raise ValueError(f"LLM returned unknown equivalent risk candidate: {equivalent}")
                 if target is not None and target not in candidate_ids:
-                    raise ValueError(f"LLM returned unknown relationship candidate: {target}")
+                    raise ValueError(f"LLM returned unknown risk relationship candidate: {target}")
                 if equivalent is not None:
                     decision["target_concept_id"] = equivalent
                 elif decision["relation"] in {"上位", "下位", "相似"} and target is None and candidates:
                     decision["target_concept_id"] = candidates[0]["concept_id"]
-                logger.bind(task="等价判定与层级关系识别", llm_usage=usage, trial_index=trial_index, seed=seed).info(
+                logger.bind(task="风险等价与类别层级关系识别", llm_usage=usage, trial_index=trial_index, seed=seed).info(
                     "LLM输出={} 耗时秒={:.3f}", json.dumps(decision, ensure_ascii=False), time.perf_counter() - started
                 )
                 return {**item, "decision": decision, "usage": usage, "error": None}
@@ -388,7 +388,7 @@ def build_experiment_graph(
                     )
                     if target and target != concept_id and decision["relation"] in {"上位", "下位", "相似"}:
                         graph_store.relate(concept_id, target, decision["relation"], decision["reason"], settings.neo4j_batch_size)
-                logger.bind(task="语义网络增量更新").info(
+                logger.bind(task="风险语义网络增量更新").info(
                     "业务输入={} 业务输出={} 耗时秒={:.3f}",
                     json.dumps({"concept": current, "decision": decision}, ensure_ascii=False),
                     json.dumps(label, ensure_ascii=False), time.perf_counter() - started,
@@ -397,7 +397,7 @@ def build_experiment_graph(
                 decisions.append({"concept": current["name"], **decision})
                 progress["bar"].update(1)
             except Exception:
-                logger.bind(task="语义网络增量更新").exception(
+                logger.bind(task="风险语义网络增量更新").exception(
                     "业务步骤失败，耗时秒={:.3f}", time.perf_counter() - started
                 )
                 raise
@@ -449,7 +449,7 @@ def build_experiment_graph(
             "ignored_cycle_edge_count": len(result.ignored_cycle_edges),
             "ignored_cycle_edges": result.ignored_cycle_edges,
         }
-        logger.bind(task="关键词颗粒度标注", granularity_report=report).info(
+        logger.bind(task="风险标签颗粒度标注", granularity_report=report).info(
             "业务输入={} 业务输出={} 耗时秒={:.3f}",
             json.dumps({"concept_count": len(concept_ids), "hierarchy_edge_count": len(hierarchy_edges)}, ensure_ascii=False),
             json.dumps(report, ensure_ascii=False),
