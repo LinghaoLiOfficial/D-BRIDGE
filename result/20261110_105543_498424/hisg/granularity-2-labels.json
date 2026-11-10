@@ -1,0 +1,57 @@
+{
+  "module": "hisg",
+  "module_name": "HISG Builder",
+  "source_trial": "trials/trial-001-seed-42",
+  "granularity": 2,
+  "label_count": 6,
+  "labels": [
+    {
+      "concept_id": "concept_44b72f53f5bc5b0189b200e760600210",
+      "name": "续航异常投诉",
+      "granularity": 2,
+      "source_post_ids": [
+        "post-005"
+      ]
+    },
+    {
+      "concept_id": "concept_8cec6fbbe0b75f6888c8cbcba1790c01",
+      "name": "软件回归测试机制不完善",
+      "granularity": 2,
+      "source_post_ids": [
+        "post-003"
+      ]
+    },
+    {
+      "concept_id": "concept_96375490a7a750d5bb9d546e4aa339ca",
+      "name": "事故调查结论披露不完整",
+      "granularity": 2,
+      "source_post_ids": [
+        "post-005"
+      ]
+    },
+    {
+      "concept_id": "concept_ab27cac1d321517aa7387a6bb1386d2a",
+      "name": "驾驶中视线转移安全隐患",
+      "granularity": 2,
+      "source_post_ids": [
+        "post-017"
+      ]
+    },
+    {
+      "concept_id": "concept_eb8d06ff373a5269a05a7592f14b45da",
+      "name": "动态引导机制不足",
+      "granularity": 2,
+      "source_post_ids": [
+        "post-007"
+      ]
+    },
+    {
+      "concept_id": "concept_f880dc6942575e819bc080ddcdf5f0c9",
+      "name": "辅助驾驶系统施工路段退出",
+      "granularity": 2,
+      "source_post_ids": [
+        "post-014"
+      ]
+    }
+  ]
+}
